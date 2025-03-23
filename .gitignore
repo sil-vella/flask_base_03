@@ -102,3 +102,7 @@ celebs_data/images/
 *.tiff
 *.svg
 *.webp
+
+# Data directories
+db_data/
+redis_data/

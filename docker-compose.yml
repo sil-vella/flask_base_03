@@ -97,3 +97,7 @@ networks:
   template_three_app_network:
     name: template_three_app_network
     driver: bridge
+
+volumes:
+  app_secrets:
+    driver: local

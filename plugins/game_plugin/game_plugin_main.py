@@ -17,23 +17,6 @@ class GamePlugin:
 
         try:
             # Ensure QuestionModule is registered FIRST
-            if not app_manager.module_manager.get_module("question_module"):
-                custom_log("Registering QuestionModule...")
-                app_manager.module_manager.register_module(
-                    "question_module", 
-                    QuestionModule, 
-                    app_manager=app_manager
-                ),
-                app_manager.module_manager.register_module(
-                    "leaderboard_module", 
-                    LeaderboardModule, 
-                    app_manager=app_manager
-                ),
-                app_manager.module_manager.register_module(
-                    "rewards_module", 
-                    RewardsModule, 
-                    app_manager=app_manager
-                ),
                 app_manager.module_manager.register_module(
                     "function_helper_module", 
                     FunctionHelperModule, 

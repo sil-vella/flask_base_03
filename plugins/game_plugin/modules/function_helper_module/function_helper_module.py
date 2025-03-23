@@ -23,7 +23,7 @@ class FunctionHelperModule:
     def get_connection_module(self):
         """Retrieve ConnectionModule from ModuleManager."""
         module_manager = self.app_manager.module_manager if self.app_manager else ModuleManager()
-        return module_manager.get_module("connection_module")
+        return module_manager.get_module("connection_api")
 
     def register_routes(self):
         """Register categories route."""

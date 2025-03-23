@@ -23,7 +23,7 @@ class LoginModule:
     def get_connection_module(self):
         """Retrieve ConnectionModule from ModuleManager."""
         module_manager = self.app_manager.module_manager if self.app_manager else ModuleManager()
-        connection_module = module_manager.get_module("connection_module")
+        connection_module = module_manager.get_module("connection_api")
 
         if not connection_module:
             custom_log("❌ ConnectionModule not found in ModuleManager.")
