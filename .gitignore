@@ -106,3 +106,4 @@ celebs_data/images/
 # Data directories
 db_data/
 redis_data/
+secrets/

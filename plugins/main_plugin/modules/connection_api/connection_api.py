@@ -22,9 +22,13 @@ class ConnectionAPI:
     def connect_to_db(self):
         """Establish a connection to the database and return the connection object."""
         try:
+            # Read password from secret file
+            with open(os.getenv("POSTGRES_PASSWORD_FILE"), 'r') as f:
+                db_password = f.read().strip()
+
             connection = psycopg2.connect(
                 user=os.getenv("POSTGRES_USER"),
-                password=os.getenv("POSTGRES_PASSWORD"),
+                password=db_password,
                 host=os.getenv("DB_HOST", "127.0.0.1"),
                 port=os.getenv("DB_PORT", "5432"),
                 database=os.getenv("POSTGRES_DB")

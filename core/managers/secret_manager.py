@@ -18,7 +18,8 @@ def get_secrets():
     required_secrets = {
         'APP_SECRET_KEY': os.environ.get('APP_SECRET_KEY_FILE'),
         'JWT_SECRET_KEY': os.environ.get('JWT_SECRET_KEY_FILE'),
-        'ENCRYPTION_KEY': os.environ.get('ENCRYPTION_KEY_FILE')
+        'ENCRYPTION_KEY': os.environ.get('ENCRYPTION_KEY_FILE'),
+        'POSTGRES_PASSWORD': os.environ.get('POSTGRES_PASSWORD_FILE')
     }
     
     # Read each secret
