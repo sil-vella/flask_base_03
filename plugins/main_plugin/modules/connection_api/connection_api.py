@@ -1,14 +1,16 @@
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 import os
 from tools.logger.custom_logging import custom_log, log_function_call
+from utils.config.config import Config
 
 class ConnectionAPI:
     def __init__(self, app_manager=None):
         self.registered_routes = []
         self.app = None  # Reference to Flask app
-        self.db_connection = self.connect_to_db()  # Initialize DB connection
         self.app_manager = app_manager  # Reference to AppManager if provided
+        self.connection_pool = self._create_connection_pool()  # Initialize connection pool
 
         # ✅ Ensure tables exist in the database
         self.initialize_database()
@@ -19,40 +21,57 @@ class ConnectionAPI:
             raise RuntimeError("ConnectionAPI requires a valid Flask app instance.")
         self.app = app
 
-    def connect_to_db(self):
-        """Establish a connection to the database and return the connection object."""
+    def _create_connection_pool(self):
+        """Create and return a connection pool."""
         try:
             # Read password from secret file
             with open(os.getenv("POSTGRES_PASSWORD_FILE"), 'r') as f:
                 db_password = f.read().strip()
 
-            connection = psycopg2.connect(
+            pool = psycopg2.pool.SimpleConnectionPool(
+                minconn=Config.DB_POOL_MIN_CONN,
+                maxconn=Config.DB_POOL_MAX_CONN,
                 user=os.getenv("POSTGRES_USER"),
                 password=db_password,
                 host=os.getenv("DB_HOST", "127.0.0.1"),
                 port=os.getenv("DB_PORT", "5432"),
                 database=os.getenv("POSTGRES_DB")
             )
-            custom_log("✅ Database connection established")
-            return connection
+            custom_log(f"✅ Database connection pool created (min: {Config.DB_POOL_MIN_CONN}, max: {Config.DB_POOL_MAX_CONN})")
+            return pool
         except Exception as e:
-            custom_log(f"❌ Error connecting to database: {e}")
+            custom_log(f"❌ Error creating connection pool: {e}")
             return None
 
     def get_connection(self):
-        """Retrieve an active database connection."""
-        if self.db_connection is None or self.db_connection.closed:
-            custom_log("🔄 Reconnecting to database...")
-            self.db_connection = self.connect_to_db()
+        """Get a connection from the pool."""
+        if self.connection_pool is None:
+            custom_log("🔄 Recreating connection pool...")
+            self.connection_pool = self._create_connection_pool()
+            if self.connection_pool is None:
+                raise RuntimeError("Failed to create database connection pool")
 
-        # ✅ Ensure autocommit mode is enabled
-        self.db_connection.autocommit = True  # Prevents transaction blocks from lingering
+        try:
+            connection = self.connection_pool.getconn()
+            connection.autocommit = True  # Prevents transaction blocks from lingering
+            custom_log("✅ Got connection from pool")
+            return connection
+        except Exception as e:
+            custom_log(f"❌ Error getting connection from pool: {e}")
+            raise
 
-        return self.db_connection
-
+    def return_connection(self, connection):
+        """Return a connection to the pool."""
+        if self.connection_pool is not None and connection is not None:
+            try:
+                self.connection_pool.putconn(connection)
+                custom_log("✅ Returned connection to pool")
+            except Exception as e:
+                custom_log(f"❌ Error returning connection to pool: {e}")
 
     def fetch_from_db(self, query, params=None, as_dict=False):
         """Execute a SELECT query and return results while handling transaction errors properly."""
+        connection = None
         try:
             connection = self.get_connection()
             cursor = connection.cursor(cursor_factory=psycopg2.extras.DictCursor if as_dict else None)
@@ -64,12 +83,16 @@ class ConnectionAPI:
             return [dict(row) for row in result] if as_dict else result
         except psycopg2.Error as e:
             custom_log(f"❌ Database error in SELECT: {e}")
-            connection.rollback()  # ✅ Ensure transaction rollback on error
+            if connection:
+                connection.rollback()  # ✅ Ensure transaction rollback on error
             return None
-
+        finally:
+            if connection:
+                self.return_connection(connection)
 
     def execute_query(self, query, params=None):
         """Execute INSERT, UPDATE, or DELETE queries and properly handle transactions."""
+        connection = None
         try:
             connection = self.get_connection()
             cursor = connection.cursor()
@@ -81,8 +104,11 @@ class ConnectionAPI:
             custom_log("✅ Query executed successfully")
         except psycopg2.Error as e:
             custom_log(f"❌ Error executing query: {e}")
-            connection.rollback()  # ✅ Rollback in case of failure
-
+            if connection:
+                connection.rollback()  # ✅ Rollback in case of failure
+        finally:
+            if connection:
+                self.return_connection(connection)
 
     def initialize_database(self):
         """Ensure required tables exist in the database."""
@@ -175,9 +201,9 @@ class ConnectionAPI:
         """Clean up registered routes and resources."""
         custom_log("🔄 Disposing ConnectionAPI...")
         self.registered_routes.clear()
-        if self.db_connection:
-            self.db_connection.close()
-            custom_log("🔌 Database connection closed.")
+        if self.connection_pool:
+            self.connection_pool.closeall()
+            custom_log("🔌 Database connection pool closed.")
 
     def get_all_user_data(self, user_id):
         """Retrieve all user data including profile, category progress, and guessed names."""
