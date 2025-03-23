@@ -1,0 +1,99 @@
+version: '3.8'
+
+services:
+  flask_app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: silvella/template_three_flask_app:latest
+    container_name: ${FLASK_SERVICE_NAME}
+    environment:
+      - PYTHONPATH=${PYTHONPATH}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - DB_HOST=${DB_HOST}
+      - REDIS_HOST=${REDIS_HOST}
+      - APP_SECRET_KEY_FILE=/run/secrets/app_secret_key
+      - JWT_SECRET_KEY_FILE=/run/secrets/jwt_secret_key
+      - ENCRYPTION_KEY_FILE=/run/secrets/encryption_key
+    ports:
+      - "${FLASK_PORT}:${FLASK_PORT}"
+    volumes:
+      - ./plugins:/app/plugins
+      - ./core:/app/core
+      - ./static:/app/static
+      - ./tools:/app/tools
+      - ./utils:/app/utils
+      - app_secrets:/run/secrets:ro
+    depends_on:
+      init-secrets:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - template_three_app_network
+    command: >
+      sh -c "
+      pip install --no-cache-dir -r /app/requirements.txt &&
+      gunicorn -b 0.0.0.0:${FLASK_PORT} app:app
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${FLASK_PORT}"]
+      interval: 10s
+      retries: 5
+      start_period: 10s
+
+  init-secrets:
+    image: alpine
+    volumes:
+      - app_secrets:/secrets
+    command: >
+      sh -c "
+        [ ! -f /secrets/app_secret_key ] && head -c32 /dev/urandom | xxd -p > /secrets/app_secret_key;
+        [ ! -f /secrets/jwt_secret_key ] && head -c32 /dev/urandom | xxd -p > /secrets/jwt_secret_key;
+        [ ! -f /secrets/encryption_key ] && head -c32 /dev/urandom | xxd -p > /secrets/encryption_key;
+        chmod 400 /secrets/*
+      "
+
+  db:
+    image: postgres:latest
+    container_name: ${POSTGRES_SERVICE_NAME}
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - ./db_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    networks:
+      - template_three_app_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:latest
+    container_name: ${REDIS_SERVICE_NAME}
+    ports:
+      - "${REDIS_PORT}:6379"
+    volumes:
+      - ./redis_data:/data
+    networks:
+      - template_three_app_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 5s
+      retries: 5
+      start_period: 10s
+    command: redis-server --appendonly yes
+
+networks:
+  template_three_app_network:
+    name: template_three_app_network
+    driver: bridge
