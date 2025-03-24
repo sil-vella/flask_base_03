@@ -9,6 +9,8 @@ secrets:
     file: ./secrets/jwt_secret_key
   encryption_key:
     file: ./secrets/encryption_key
+  redis_password:
+    file: ./secrets/redis_password
 
 services:
   flask_app:
@@ -24,6 +26,8 @@ services:
       - POSTGRES_HOST=${POSTGRES_HOST}
       - DB_HOST=${DB_HOST}
       - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_PASSWORD_FILE=/run/secrets/redis_password
       - APP_SECRET_KEY_FILE=/run/secrets/app_secret_key
       - JWT_SECRET_KEY_FILE=/run/secrets/jwt_secret_key
       - ENCRYPTION_KEY_FILE=/run/secrets/encryption_key
@@ -41,6 +45,7 @@ services:
       - app_secret_key
       - jwt_secret_key
       - encryption_key
+      - redis_password
     depends_on:
       init-secrets:
         condition: service_completed_successfully
@@ -71,6 +76,7 @@ services:
         [ ! -f /secrets/jwt_secret_key ] && head -c32 /dev/urandom | xxd -p > /secrets/jwt_secret_key;
         [ ! -f /secrets/encryption_key ] && head -c32 /dev/urandom | xxd -p > /secrets/encryption_key;
         [ ! -f /secrets/postgres_password ] && head -c32 /dev/urandom | xxd -p > /secrets/postgres_password;
+        [ ! -f /secrets/redis_password ] && head -c32 /dev/urandom | xxd -p > /secrets/redis_password;
         chmod 400 /secrets/*
       "
 
@@ -101,6 +107,10 @@ services:
       - "${REDIS_PORT}:6379"
     volumes:
       - ./redis_data:/data
+    environment:
+      - REDIS_PASSWORD_FILE=/run/secrets/redis_password
+    secrets:
+      - redis_password
     networks:
       - template_three_app_network
     healthcheck:
@@ -108,7 +118,11 @@ services:
       interval: 5s
       retries: 5
       start_period: 10s
-    command: redis-server --appendonly yes
+    command: >
+      sh -c "
+        REDIS_PASSWORD=$$(cat /run/secrets/redis_password)
+        redis-server --requirepass $$REDIS_PASSWORD --appendonly yes
+      "
 
 networks:
   template_three_app_network:

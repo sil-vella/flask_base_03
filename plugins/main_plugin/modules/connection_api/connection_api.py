@@ -2,15 +2,19 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 import os
+import json
 from tools.logger.custom_logging import custom_log, log_function_call
 from utils.config.config import Config
+from core.managers.redis_manager import RedisManager
+from datetime import datetime
 
 class ConnectionAPI:
     def __init__(self, app_manager=None):
         self.registered_routes = []
         self.app = None  # Reference to Flask app
         self.app_manager = app_manager  # Reference to AppManager if provided
-        self.connection_pool = self._create_connection_pool()  # Initialize connection pool
+        self.connection_pool = self._create_connection_pool()  # Initialize PostgreSQL connection pool
+        self.redis_manager = RedisManager()  # Initialize Redis manager
 
         # ✅ Ensure tables exist in the database
         self.initialize_database()
@@ -22,7 +26,7 @@ class ConnectionAPI:
         self.app = app
 
     def _create_connection_pool(self):
-        """Create and return a connection pool."""
+        """Create and return a PostgreSQL connection pool."""
         try:
             # Read password from secret file
             with open(os.getenv("POSTGRES_PASSWORD_FILE"), 'r') as f:
@@ -44,7 +48,7 @@ class ConnectionAPI:
             return None
 
     def get_connection(self):
-        """Get a connection from the pool."""
+        """Get a connection from the pool and cache its state in Redis."""
         if self.connection_pool is None:
             custom_log("🔄 Recreating connection pool...")
             self.connection_pool = self._create_connection_pool()
@@ -54,58 +58,108 @@ class ConnectionAPI:
         try:
             connection = self.connection_pool.getconn()
             connection.autocommit = True  # Prevents transaction blocks from lingering
-            custom_log("✅ Got connection from pool")
+            
+            # Cache connection state in Redis
+            conn_id = id(connection)
+            self.redis.client.hset(f"db_connection:{conn_id}", mapping={
+                "created_at": str(datetime.now().isoformat()),
+                "status": "active",
+                "autocommit": "true"
+            })
+            self.redis.client.expire(f"db_connection:{conn_id}", 300)  # Cache for 5 minutes
+            
+            custom_log(f"✅ Got connection from pool (ID: {conn_id})")
             return connection
         except Exception as e:
             custom_log(f"❌ Error getting connection from pool: {e}")
             raise
 
     def return_connection(self, connection):
-        """Return a connection to the pool."""
+        """Return a connection to the pool and update Redis cache."""
         if self.connection_pool is not None and connection is not None:
             try:
+                conn_id = id(connection)
+                # Update connection state in Redis
+                self.redis.client.hset(f"db_connection:{conn_id}", mapping={
+                    "status": "returned",
+                    "returned_at": str(datetime.now().isoformat())
+                })
+                self.redis.client.expire(f"db_connection:{conn_id}", 300)  # Cache for 5 minutes
+                
                 self.connection_pool.putconn(connection)
-                custom_log("✅ Returned connection to pool")
+                custom_log(f"✅ Returned connection to pool (ID: {conn_id})")
             except Exception as e:
                 custom_log(f"❌ Error returning connection to pool: {e}")
 
     def fetch_from_db(self, query, params=None, as_dict=False):
-        """Execute a SELECT query and return results while handling transaction errors properly."""
+        """Execute a SELECT query and cache results in Redis."""
         connection = None
         try:
             connection = self.get_connection()
             cursor = connection.cursor(cursor_factory=psycopg2.extras.DictCursor if as_dict else None)
             
+            # Create cache key based on query and parameters
+            cache_key = f"query:{hash(query + str(params or ()))}"
+            
+            # Try to get from Redis cache first
+            cached_result = self.redis.client.get(cache_key)
+            if cached_result:
+                custom_log(f"✅ Retrieved query result from Redis cache")
+                result = json.loads(cached_result)
+                # Convert list of lists back to list of tuples for non-dict results
+                if not as_dict:
+                    result = [tuple(row) for row in result]
+                return result
+            
             cursor.execute(query, params or ())
             result = cursor.fetchall()
             cursor.close()
             
-            return [dict(row) for row in result] if as_dict else result
+            # Convert to dict if requested
+            if as_dict:
+                processed_result = [dict(row) for row in result]
+            else:
+                # Convert tuples to lists for JSON serialization
+                processed_result = [list(row) for row in result]
+            
+            # Cache the result in Redis for 5 minutes
+            self.redis.client.setex(cache_key, 300, json.dumps(processed_result))
+            custom_log(f"✅ Cached query result in Redis")
+            
+            # Return original format
+            if not as_dict:
+                result = [tuple(row) for row in processed_result]
+                return result
+            return processed_result
         except psycopg2.Error as e:
             custom_log(f"❌ Database error in SELECT: {e}")
             if connection:
-                connection.rollback()  # ✅ Ensure transaction rollback on error
+                connection.rollback()
             return None
         finally:
             if connection:
                 self.return_connection(connection)
 
     def execute_query(self, query, params=None):
-        """Execute INSERT, UPDATE, or DELETE queries and properly handle transactions."""
+        """Execute INSERT, UPDATE, or DELETE queries and invalidate relevant caches."""
         connection = None
         try:
             connection = self.get_connection()
             cursor = connection.cursor()
 
             cursor.execute(query, params or ())
-            connection.commit()  # ✅ Commit the transaction
+            connection.commit()
             cursor.close()
+            
+            # Invalidate any cached results for this query
+            cache_key = f"query:{hash(query + str(params or ()))}"
+            self.redis.client.delete(cache_key)
             
             custom_log("✅ Query executed successfully")
         except psycopg2.Error as e:
             custom_log(f"❌ Error executing query: {e}")
             if connection:
-                connection.rollback()  # ✅ Rollback in case of failure
+                connection.rollback()
         finally:
             if connection:
                 self.return_connection(connection)
@@ -113,11 +167,7 @@ class ConnectionAPI:
     def initialize_database(self):
         """Ensure required tables exist in the database."""
         custom_log("⚙️ Initializing database tables...")
-
         self._create_users_table()
-        self._create_user_category_progress_table()
-        self._create_guessed_names_table()
-
         custom_log("✅ Database tables verified.")
 
     def _create_users_table(self):
@@ -134,56 +184,6 @@ class ConnectionAPI:
         """
         self.execute_query(query)
         custom_log("✅ Users table verified.")
-
-    def _create_user_category_progress_table(self):
-        """Create table to track user levels and points per category and level."""
-        query = """
-        CREATE TABLE IF NOT EXISTS user_category_progress (
-            id SERIAL PRIMARY KEY,
-            user_id INT NOT NULL,
-            category VARCHAR(50) NOT NULL,
-            level INT NOT NULL,
-            points INT DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            UNIQUE (user_id, category, level)
-        );
-        """
-        self.execute_query(query)
-        custom_log("✅ User category progress table verified.")
-
-    def _create_guessed_names_table(self):
-        """Create guessed_names table if it doesn't exist."""
-        query = """
-        CREATE TABLE IF NOT EXISTS guessed_names (
-            id SERIAL PRIMARY KEY,
-            user_id INT NOT NULL,
-            category VARCHAR(50) NOT NULL,
-            level INT NOT NULL DEFAULT 1,
-            guessed_name VARCHAR(100) NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            UNIQUE (user_id, category, level, guessed_name)
-        );
-        """
-        self.execute_query(query)
-        custom_log("✅ Guessed names table verified.")
-
-    def add_guessed_name(self, user_id, category, level, guessed_name):
-        """Add a guessed name for a specific user, category, and level."""
-        query = """
-        INSERT INTO guessed_names (user_id, category, level, guessed_name)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (user_id, category, level, guessed_name) DO NOTHING;
-        """
-        self.execute_query(query, (user_id, category, level, guessed_name))
-
-    def get_guessed_names(self, user_id, category, level):
-        """Retrieve guessed names for a user in a specific category and level."""
-        query = "SELECT guessed_name FROM guessed_names WHERE user_id = %s AND category = %s AND level = %s"
-        results = self.fetch_from_db(query, (user_id, category, level), as_dict=True)
-        return [row['guessed_name'] for row in results] if results else []
 
     def register_route(self, path, view_func, methods=None, endpoint=None):
         """Register a route with the Flask app."""
@@ -204,39 +204,49 @@ class ConnectionAPI:
         if self.connection_pool:
             self.connection_pool.closeall()
             custom_log("🔌 Database connection pool closed.")
+        if self.redis_manager:
+            self.redis_manager.dispose()
+            custom_log("🔌 Redis connections closed.")
 
-    def get_all_user_data(self, user_id):
-        """Retrieve all user data including profile, category progress, and guessed names."""
-        try:
-            user_query = "SELECT id, username, email, total_points, created_at FROM users WHERE id = %s"
-            user_data = self.fetch_from_db(user_query, (user_id,), as_dict=True)
+    def cache_user_data(self, user_id, data):
+        """Cache user data in Redis."""
+        cache_key = f"user_data:{user_id}"
+        self.redis.client.setex(cache_key, 300, json.dumps(data))
+        custom_log(f"✅ Cached user data for user {user_id}")
 
-            if not user_data:
-                return {"error": f"User with ID {user_id} not found"}, 404
+    def get_cached_user_data(self, user_id):
+        """Get cached user data from Redis."""
+        cache_key = f"user_data:{user_id}"
+        data = self.redis.client.get(cache_key)
+        if data:
+            return json.loads(data)
+        return None
 
-            user_info = user_data[0]
+    def cache_guessed_names(self, user_id, names):
+        """Cache guessed names in Redis."""
+        cache_key = f"guessed_names:{user_id}"
+        self.redis.client.setex(cache_key, 300, json.dumps(names))
+        custom_log(f"✅ Cached guessed names for user {user_id}")
 
-            progress_query = """
-            SELECT category, level, points FROM user_category_progress WHERE user_id = %s
-            """
-            progress_data = self.fetch_from_db(progress_query, (user_id,), as_dict=True)
+    def get_cached_guessed_names(self, user_id):
+        """Get cached guessed names from Redis."""
+        cache_key = f"guessed_names:{user_id}"
+        data = self.redis.client.get(cache_key)
+        if data:
+            return json.loads(data)
+        return None
 
-            category_progress = {row["category"]: {row["level"]: {"points": row["points"]}} for row in progress_data}
+    def add_guessed_name(self, user_id, name):
+        """Add a guessed name and invalidate relevant caches."""
+        query = "INSERT INTO guessed_names (user_id, name) VALUES (%s, %s)"
+        self.execute_query(query, (user_id, name))
+        
+        # Invalidate guessed names cache
+        cache_key = f"guessed_names:{user_id}"
+        self.redis.client.delete(cache_key)
+        custom_log(f"✅ Added guessed name for user {user_id}")
 
-            guessed_query = """
-            SELECT category, level, guessed_name FROM guessed_names WHERE user_id = %s
-            """
-            guessed_data = self.fetch_from_db(guessed_query, (user_id,), as_dict=True)
-
-            guessed_names = {row["category"]: {row["level"]: [row["guessed_name"]]} for row in guessed_data}
-
-            return {
-                "user_info": user_info,
-                "category_progress": category_progress,
-                "guessed_names": guessed_names,
-                "total_points": user_info["total_points"]
-            }, 200
-
-        except Exception as e:
-            custom_log(f"❌ Error fetching user data: {e}")
-            return {"error": f"Server error: {str(e)}"}, 500
+    @property
+    def redis(self):
+        """Access Redis manager methods directly."""
+        return self.redis_manager
