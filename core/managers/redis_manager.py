@@ -4,12 +4,17 @@ from redis import Redis
 from redis.connection import ConnectionPool
 from typing import Optional, Any, Union, List
 from tools.logger.custom_logging import custom_log
+import hashlib
+from utils.config.config import Config
+import json
+import base64
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 class RedisManager:
     _instance = None
-    _pool = None
-    _redis_client = None
-    _test_mode = False
+    _initialized = False
 
     def __new__(cls):
         if cls._instance is None:
@@ -17,193 +22,279 @@ class RedisManager:
         return cls._instance
 
     def __init__(self):
-        if not self._pool:
-            self._initialize_pool()
+        if not RedisManager._initialized:
+            self.redis = None
+            self.connection_pool = None
+            self._initialize_connection_pool()
+            self._setup_encryption()
+            RedisManager._initialized = True
 
-    def _initialize_pool(self):
-        """Initialize Redis connection pool."""
+    def _setup_encryption(self):
+        """Set up encryption key using PBKDF2."""
+        # Use Redis password as salt for key derivation
+        salt = os.getenv("REDIS_PASSWORD", "").encode()
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(os.getenv("REDIS_PASSWORD", "").encode()))
+        self.cipher_suite = Fernet(key)
+
+    def _initialize_connection_pool(self):
+        """Initialize Redis connection pool with security settings."""
         try:
-            # Read password from secret file
-            with open(os.getenv("REDIS_PASSWORD_FILE"), 'r') as f:
-                redis_password = f.read().strip()
-
+            redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+            
+            # Get Redis password from file if specified
+            redis_password = ""
+            redis_password_file = os.getenv("REDIS_PASSWORD_FILE")
+            if redis_password_file and os.path.exists(redis_password_file):
+                with open(redis_password_file, 'r') as f:
+                    redis_password = f.read().strip()
+            else:
+                redis_password = os.getenv("REDIS_PASSWORD", "")
+            
+            # Parse Redis URL to get host and port
+            redis_host = os.getenv("REDIS_HOST", "localhost")
+            redis_port = int(os.getenv("REDIS_PORT", "6379"))
+            
+            # Base connection pool settings
+            pool_settings = {
+                'host': redis_host,
+                'port': redis_port,
+                'password': redis_password,
+                'decode_responses': True,
+                'socket_timeout': 5,
+                'socket_connect_timeout': 5,
+                'retry_on_timeout': True
+            }
+            
+            # Add SSL settings only if SSL is enabled
+            if Config.REDIS_USE_SSL:
+                pool_settings.update({
+                    'ssl': True,
+                    'ssl_cert_reqs': Config.REDIS_SSL_VERIFY_MODE
+                })
+            
             # Create connection pool
-            self._pool = ConnectionPool(
-                host=os.getenv("REDIS_HOST", "localhost"),
-                port=int(os.getenv("REDIS_PORT", 6379)),
-                db=int(os.getenv("REDIS_DB", 0)),
-                password=redis_password,
-                decode_responses=True,  # Automatically decode responses to strings
-                max_connections=10  # Maximum number of connections in the pool
-            )
-            custom_log("✅ Redis connection pool initialized")
+            self.connection_pool = redis.ConnectionPool(**pool_settings)
+            
+            # Test connection
+            self.redis = redis.Redis(connection_pool=self.connection_pool)
+            self.redis.ping()
+            custom_log("✅ Redis connection pool initialized successfully")
         except Exception as e:
-            custom_log(f"❌ Error initializing Redis pool: {e}")
+            custom_log(f"❌ Error initializing Redis connection pool: {e}")
             raise
 
-    @property
-    def client(self) -> Redis:
-        """Get Redis client instance."""
-        if not self._redis_client:
-            try:
-                self._redis_client = redis.Redis(connection_pool=self._pool)
-                # Test connection
-                self._redis_client.ping()
-                custom_log("✅ Redis client initialized and connected")
-            except Exception as e:
-                custom_log(f"❌ Error creating Redis client: {e}")
-                raise
-        return self._redis_client
+    def _generate_secure_key(self, prefix, *args):
+        """Generate a cryptographically secure cache key."""
+        # Combine all arguments into a single string
+        key_data = ':'.join(str(arg) for arg in args)
+        
+        # Use SHA-256 for key generation
+        key_hash = hashlib.sha256(key_data.encode()).hexdigest()
+        
+        # Add prefix and hash to create final key
+        return f"{prefix}:{key_hash}"
 
-    def get(self, key: str) -> Optional[str]:
-        """Get value by key."""
+    def _encrypt_data(self, data):
+        """Encrypt data before storing in Redis."""
+        if isinstance(data, (dict, list)):
+            data = json.dumps(data)
+        return self.cipher_suite.encrypt(data.encode()).decode()
+
+    def _decrypt_data(self, encrypted_data):
+        """Decrypt data retrieved from Redis."""
         try:
-            value = self.client.get(key)
-            custom_log(f"✅ Retrieved key: {key}")
-            return value
-        except Exception as e:
-            custom_log(f"❌ Error getting key {key}: {e}")
+            decrypted = self.cipher_suite.decrypt(encrypted_data.encode())
+            return json.loads(decrypted.decode())
+        except:
             return None
 
-    def set(self, key: str, value: str, expire: Optional[int] = None) -> bool:
-        """Set key-value pair with optional expiration."""
+    def get(self, key, *args):
+        """Get value from Redis with secure key generation."""
         try:
-            self.client.set(key, value, ex=expire)
-            custom_log(f"✅ Set key: {key}")
+            secure_key = self._generate_secure_key(key, *args)
+            value = self.redis.get(secure_key)
+            if value:
+                return self._decrypt_data(value)
+            return None
+        except Exception as e:
+            custom_log(f"❌ Error getting value from Redis: {e}")
+            return None
+
+    def set(self, key, value, expire=None, *args):
+        """Set value in Redis with secure key generation and encryption."""
+        try:
+            secure_key = self._generate_secure_key(key, *args)
+            encrypted_value = self._encrypt_data(value)
+            if expire:
+                self.redis.setex(secure_key, expire, encrypted_value)
+            else:
+                self.redis.set(secure_key, encrypted_value)
             return True
         except Exception as e:
-            custom_log(f"❌ Error setting key {key}: {e}")
+            custom_log(f"❌ Error setting value in Redis: {e}")
             return False
 
-    def delete(self, key: str) -> bool:
-        """Delete a key."""
+    def delete(self, key, *args):
+        """Delete value from Redis with secure key generation."""
         try:
-            self.client.delete(key)
-            custom_log(f"✅ Deleted key: {key}")
+            secure_key = self._generate_secure_key(key, *args)
+            self.redis.delete(secure_key)
             return True
         except Exception as e:
-            custom_log(f"❌ Error deleting key {key}: {e}")
+            custom_log(f"❌ Error deleting value from Redis: {e}")
             return False
 
-    def exists(self, key: str) -> bool:
-        """Check if key exists."""
+    def exists(self, key, *args):
+        """Check if key exists in Redis with secure key generation."""
         try:
-            return bool(self.client.exists(key))
+            secure_key = self._generate_secure_key(key, *args)
+            return self.redis.exists(secure_key)
         except Exception as e:
-            custom_log(f"❌ Error checking existence of key {key}: {e}")
+            custom_log(f"❌ Error checking key existence in Redis: {e}")
             return False
 
-    def expire(self, key: str, seconds: int) -> bool:
-        """Set expiration time for a key."""
+    def expire(self, key, seconds, *args):
+        """Set expiration for key in Redis with secure key generation."""
         try:
-            return bool(self.client.expire(key, seconds))
+            secure_key = self._generate_secure_key(key, *args)
+            return self.redis.expire(secure_key, seconds)
         except Exception as e:
-            custom_log(f"❌ Error setting expiration for key {key}: {e}")
+            custom_log(f"❌ Error setting expiration in Redis: {e}")
             return False
 
-    def ttl(self, key: str) -> int:
-        """Get remaining time to live of a key."""
+    def ttl(self, key, *args):
+        """Get time to live for key in Redis with secure key generation."""
         try:
-            return self.client.ttl(key)
+            secure_key = self._generate_secure_key(key, *args)
+            return self.redis.ttl(secure_key)
         except Exception as e:
-            custom_log(f"❌ Error getting TTL for key {key}: {e}")
-            return -2  # Key does not exist
+            custom_log(f"❌ Error getting TTL from Redis: {e}")
+            return -1
 
-    def incr(self, key: str, amount: int = 1) -> Optional[int]:
-        """Increment value of a key."""
+    def incr(self, key, *args):
+        """Increment value in Redis with secure key generation."""
         try:
-            return self.client.incr(key, amount)
+            secure_key = self._generate_secure_key(key, *args)
+            return self.redis.incr(secure_key)
         except Exception as e:
-            custom_log(f"❌ Error incrementing key {key}: {e}")
+            custom_log(f"❌ Error incrementing value in Redis: {e}")
             return None
 
-    def decr(self, key: str, amount: int = 1) -> Optional[int]:
-        """Decrement value of a key."""
+    def decr(self, key, *args):
+        """Decrement value in Redis with secure key generation."""
         try:
-            return self.client.decr(key, amount)
+            secure_key = self._generate_secure_key(key, *args)
+            return self.redis.decr(secure_key)
         except Exception as e:
-            custom_log(f"❌ Error decrementing key {key}: {e}")
+            custom_log(f"❌ Error decrementing value in Redis: {e}")
             return None
 
-    def hset(self, name: str, key: str, value: str) -> bool:
-        """Set hash field."""
+    def hset(self, key, field, value, *args):
+        """Set hash field in Redis with secure key generation and encryption."""
         try:
-            return bool(self.client.hset(name, key, value))
+            secure_key = self._generate_secure_key(key, *args)
+            encrypted_value = self._encrypt_data(value)
+            return self.redis.hset(secure_key, field, encrypted_value)
         except Exception as e:
-            custom_log(f"❌ Error setting hash field {key} in {name}: {e}")
+            custom_log(f"❌ Error setting hash field in Redis: {e}")
             return False
 
-    def hget(self, name: str, key: str) -> Optional[str]:
-        """Get hash field."""
+    def hget(self, key, field, *args):
+        """Get hash field from Redis with secure key generation and decryption."""
         try:
-            return self.client.hget(name, key)
+            secure_key = self._generate_secure_key(key, *args)
+            value = self.redis.hget(secure_key, field)
+            if value:
+                return self._decrypt_data(value)
+            return None
         except Exception as e:
-            custom_log(f"❌ Error getting hash field {key} from {name}: {e}")
+            custom_log(f"❌ Error getting hash field from Redis: {e}")
             return None
 
-    def hdel(self, name: str, key: str) -> bool:
-        """Delete hash field."""
+    def hdel(self, key, field, *args):
+        """Delete hash field from Redis with secure key generation."""
         try:
-            return bool(self.client.hdel(name, key))
+            secure_key = self._generate_secure_key(key, *args)
+            return self.redis.hdel(secure_key, field)
         except Exception as e:
-            custom_log(f"❌ Error deleting hash field {key} from {name}: {e}")
+            custom_log(f"❌ Error deleting hash field from Redis: {e}")
             return False
 
-    def hgetall(self, name: str) -> dict:
-        """Get all hash fields and values."""
+    def hgetall(self, key, *args):
+        """Get all hash fields from Redis with secure key generation and decryption."""
         try:
-            return self.client.hgetall(name)
+            secure_key = self._generate_secure_key(key, *args)
+            values = self.redis.hgetall(secure_key)
+            return {k: self._decrypt_data(v) for k, v in values.items()}
         except Exception as e:
-            custom_log(f"❌ Error getting all hash fields from {name}: {e}")
+            custom_log(f"❌ Error getting all hash fields from Redis: {e}")
             return {}
 
-    def lpush(self, name: str, value: str) -> Optional[int]:
-        """Push value to list."""
+    def lpush(self, key, value, *args):
+        """Push value to list in Redis with secure key generation and encryption."""
         try:
-            return self.client.lpush(name, value)
+            secure_key = self._generate_secure_key(key, *args)
+            encrypted_value = self._encrypt_data(value)
+            return self.redis.lpush(secure_key, encrypted_value)
         except Exception as e:
-            custom_log(f"❌ Error pushing to list {name}: {e}")
+            custom_log(f"❌ Error pushing to list in Redis: {e}")
+            return False
+
+    def rpush(self, key, value, *args):
+        """Push value to end of list in Redis with secure key generation and encryption."""
+        try:
+            secure_key = self._generate_secure_key(key, *args)
+            encrypted_value = self._encrypt_data(value)
+            return self.redis.rpush(secure_key, encrypted_value)
+        except Exception as e:
+            custom_log(f"❌ Error pushing to end of list in Redis: {e}")
+            return False
+
+    def lpop(self, key, *args):
+        """Pop value from list in Redis with secure key generation and decryption."""
+        try:
+            secure_key = self._generate_secure_key(key, *args)
+            value = self.redis.lpop(secure_key)
+            if value:
+                return self._decrypt_data(value)
+            return None
+        except Exception as e:
+            custom_log(f"❌ Error popping from list in Redis: {e}")
             return None
 
-    def rpush(self, name: str, value: str) -> Optional[int]:
-        """Push value to end of list."""
+    def rpop(self, key, *args):
+        """Pop value from end of list in Redis with secure key generation and decryption."""
         try:
-            return self.client.rpush(name, value)
+            secure_key = self._generate_secure_key(key, *args)
+            value = self.redis.rpop(secure_key)
+            if value:
+                return self._decrypt_data(value)
+            return None
         except Exception as e:
-            custom_log(f"❌ Error pushing to end of list {name}: {e}")
+            custom_log(f"❌ Error popping from end of list in Redis: {e}")
             return None
 
-    def lpop(self, name: str) -> Optional[str]:
-        """Pop value from list."""
+    def lrange(self, key, start, end, *args):
+        """Get range of values from list in Redis with secure key generation and decryption."""
         try:
-            return self.client.lpop(name)
+            secure_key = self._generate_secure_key(key, *args)
+            values = self.redis.lrange(secure_key, start, end)
+            return [self._decrypt_data(v) for v in values]
         except Exception as e:
-            custom_log(f"❌ Error popping from list {name}: {e}")
-            return None
-
-    def rpop(self, name: str) -> Optional[str]:
-        """Pop value from end of list."""
-        try:
-            return self.client.rpop(name)
-        except Exception as e:
-            custom_log(f"❌ Error popping from end of list {name}: {e}")
-            return None
-
-    def lrange(self, name: str, start: int, end: int) -> List[str]:
-        """Get range of values from list."""
-        try:
-            return self.client.lrange(name, start, end)
-        except Exception as e:
-            custom_log(f"❌ Error getting range from list {name}: {e}")
+            custom_log(f"❌ Error getting range from list in Redis: {e}")
             return []
 
     def dispose(self):
         """Clean up Redis connections."""
         try:
-            if self._redis_client:
-                self._redis_client.close()
-            if self._pool:
-                self._pool.disconnect()
-            custom_log("✅ Redis connections closed")
+            if self.connection_pool:
+                self.connection_pool.disconnect()
+                custom_log("✅ Redis connection pool disposed")
         except Exception as e:
-            custom_log(f"❌ Error disposing Redis connections: {e}") 
+            custom_log(f"❌ Error disposing Redis connection pool: {e}") 

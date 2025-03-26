@@ -31,3 +31,7 @@ black==23.1.0
 
 # YAML support
 PyYAML==6.0.1
+
+# Redis Security
+cryptography>=41.0.0
+redis>=4.5.0

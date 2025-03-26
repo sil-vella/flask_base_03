@@ -33,3 +33,18 @@ class Config:
 
     # Enable or disable logging
     LOGGING_ENABLED = os.getenv("LOGGING_ENABLED", "True").lower() in ("true", "1")
+
+    # Redis Security Settings
+    REDIS_USE_SSL = os.getenv("REDIS_USE_SSL", "false").lower() == "true"
+    REDIS_SSL_VERIFY_MODE = os.getenv("REDIS_SSL_VERIFY_MODE", "required")
+    REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "10"))
+    REDIS_SOCKET_TIMEOUT = int(os.getenv("REDIS_SOCKET_TIMEOUT", "5"))
+    REDIS_SOCKET_CONNECT_TIMEOUT = int(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "5"))
+    REDIS_RETRY_ON_TIMEOUT = os.getenv("REDIS_RETRY_ON_TIMEOUT", "true").lower() == "true"
+    REDIS_MAX_RETRIES = int(os.getenv("REDIS_MAX_RETRIES", "3"))
+    REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "app")
+    REDIS_ENCRYPTION_KEY = os.getenv("REDIS_ENCRYPTION_KEY", "")
+    REDIS_ENCRYPTION_SALT = os.getenv("REDIS_ENCRYPTION_SALT", "")
+    REDIS_ENCRYPTION_ITERATIONS = int(os.getenv("REDIS_ENCRYPTION_ITERATIONS", "100000"))
+    REDIS_MAX_CACHE_SIZE = int(os.getenv("REDIS_MAX_CACHE_SIZE", "1048576"))  # 1MB in bytes
+    REDIS_CACHE_TTL = int(os.getenv("REDIS_CACHE_TTL", "300"))  # 5 minutes in seconds

@@ -203,12 +203,8 @@ class LoginModule:
 
             # ✅ Insert new user
             hashed_password = self.hash_password(password)
-            insert_user_query = "INSERT INTO users (username, email, password) VALUES (%s, %s, %s) RETURNING id;"
-            user_result = self.connection_module.fetch_from_db(insert_user_query, (username, email, hashed_password))
-
-            if not user_result:
-                custom_log("❌ Insert failed: No ID returned from insert statement.")
-                return jsonify({"error": "User registration failed."}), 500
+            insert_user_query = "INSERT INTO users (username, email, password) VALUES (%s, %s, %s);"
+            self.connection_module.execute_query(insert_user_query, (username, email, hashed_password))
 
             custom_log(f"✅ User '{username}' registered successfully.")
             return jsonify({"message": "User registered successfully"}), 200

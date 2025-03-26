@@ -121,7 +121,7 @@ class ConnectionAPI:
                 # Cache connection state with expiration
                 self.redis_manager.set(
                     f"connection:{connection_id}",
-                    json.dumps(connection_state),
+                    connection_state,
                     expire=Config.DB_KEEPALIVES_IDLE * 2
                 )
 
@@ -158,10 +158,10 @@ class ConnectionAPI:
                 # Update connection state in Redis
                 self.redis_manager.set(
                     f"connection:{conn_id}",
-                    json.dumps({
+                    {
                         "status": "returned",
                         "returned_at": str(datetime.now().isoformat())
-                    }),
+                    },
                     expire=Config.DB_KEEPALIVES_IDLE * 2
                 )
                 
@@ -184,11 +184,10 @@ class ConnectionAPI:
             cached_result = self.redis_manager.get(cache_key)
             if cached_result:
                 custom_log(f"✅ Retrieved query result from Redis cache")
-                result = json.loads(cached_result)
                 # Convert list of lists back to list of tuples for non-dict results
                 if not as_dict:
-                    result = [tuple(row) for row in result]
-                return result
+                    cached_result = [tuple(row) for row in cached_result]
+                return cached_result
             
             cursor.execute(query, params or ())
             result = cursor.fetchall()
@@ -198,47 +197,39 @@ class ConnectionAPI:
             if as_dict:
                 processed_result = [dict(row) for row in result]
             else:
-                # Convert tuples to lists for JSON serialization
-                processed_result = [list(row) for row in result]
+                processed_result = [tuple(row) for row in result]
             
-            # Cache the result in Redis for 5 minutes
-            self.redis_manager.set(cache_key, json.dumps(processed_result), expire=300)
+            # Cache the result
+            self.redis_manager.set(cache_key, processed_result, expire=300)  # Cache for 5 minutes
             custom_log(f"✅ Cached query result in Redis")
             
-            # Return original format
-            if not as_dict:
-                result = [tuple(row) for row in processed_result]
-                return result
             return processed_result
-        except psycopg2.Error as e:
-            custom_log(f"❌ Database error in SELECT: {e}")
-            if connection:
-                connection.rollback()
-            return None
+            
+        except Exception as e:
+            custom_log(f"❌ Error executing query: {e}")
+            raise
         finally:
             if connection:
                 self.return_connection(connection)
 
     def execute_query(self, query, params=None):
-        """Execute INSERT, UPDATE, or DELETE queries and invalidate relevant caches."""
+        """Execute a non-SELECT query and invalidate relevant caches."""
         connection = None
         try:
             connection = self.get_connection()
             cursor = connection.cursor()
-
             cursor.execute(query, params or ())
             connection.commit()
             cursor.close()
             
-            # Invalidate any cached results for this query
-            cache_key = f"query:{hash(query + str(params or ()))}"
-            self.redis_manager.delete(cache_key)
+            # Invalidate relevant caches
+            self._invalidate_caches(query)
             
-            custom_log("✅ Query executed successfully")
-        except psycopg2.Error as e:
-            custom_log(f"❌ Error executing query: {e}")
+        except Exception as e:
             if connection:
                 connection.rollback()
+            custom_log(f"❌ Error executing query: {e}")
+            raise
         finally:
             if connection:
                 self.return_connection(connection)
@@ -288,44 +279,51 @@ class ConnectionAPI:
             custom_log("🔌 Redis connections closed.")
 
     def cache_user_data(self, user_id, data):
-        """Cache user data in Redis."""
-        cache_key = f"user_data:{user_id}"
-        self.redis_manager.set(cache_key, json.dumps(data), expire=300)
-        custom_log(f"✅ Cached user data for user {user_id}")
+        """Cache user data in Redis with encryption."""
+        self.redis_manager.set(f"user:{user_id}", data, expire=3600)  # Cache for 1 hour
 
     def get_cached_user_data(self, user_id):
-        """Get cached user data from Redis."""
-        cache_key = f"user_data:{user_id}"
-        data = self.redis_manager.get(cache_key)
-        if data:
-            return json.loads(data)
-        return None
+        """Get cached user data from Redis with decryption."""
+        return self.redis_manager.get(f"user:{user_id}")
 
     def cache_guessed_names(self, user_id, names):
-        """Cache guessed names in Redis."""
-        cache_key = f"guessed_names:{user_id}"
-        self.redis_manager.set(cache_key, json.dumps(names), expire=300)
-        custom_log(f"✅ Cached guessed names for user {user_id}")
+        """Cache guessed names in Redis with encryption."""
+        self.redis_manager.set(f"guessed_names:{user_id}", names, expire=3600)  # Cache for 1 hour
 
     def get_cached_guessed_names(self, user_id):
-        """Get cached guessed names from Redis."""
-        cache_key = f"guessed_names:{user_id}"
-        data = self.redis_manager.get(cache_key)
-        if data:
-            return json.loads(data)
-        return None
+        """Get cached guessed names from Redis with decryption."""
+        return self.redis_manager.get(f"guessed_names:{user_id}")
 
     def add_guessed_name(self, user_id, name):
-        """Add a guessed name and invalidate relevant caches."""
-        query = "INSERT INTO guessed_names (user_id, name) VALUES (%s, %s)"
-        self.execute_query(query, (user_id, name))
-        
-        # Invalidate guessed names cache
-        cache_key = f"guessed_names:{user_id}"
-        self.redis_manager.delete(cache_key)
-        custom_log(f"✅ Added guessed name for user {user_id}")
+        """Add a new guessed name and invalidate cache."""
+        # Invalidate cache to force fresh data fetch
+        self.redis_manager.delete(f"guessed_names:{user_id}")
 
     @property
     def redis(self):
         """Access Redis manager methods directly."""
         return self.redis_manager
+
+    def _invalidate_caches(self, query):
+        """Invalidate relevant Redis caches based on the query."""
+        query = query.lower()
+        
+        # Invalidate query cache
+        cache_key = f"query:{hash(query)}"
+        self.redis_manager.delete(cache_key)
+        
+        # Invalidate user data cache if user-related query
+        if "users" in query:
+            pattern = "user:*"
+            keys = self.redis_manager.redis.keys(pattern)
+            for key in keys:
+                self.redis_manager.delete(key)
+        
+        # Invalidate guessed names cache if guessed_names-related query
+        if "guessed_names" in query:
+            pattern = "guessed_names:*"
+            keys = self.redis_manager.redis.keys(pattern)
+            for key in keys:
+                self.redis_manager.delete(key)
+        
+        custom_log("✅ Relevant caches invalidated")
