@@ -7,6 +7,7 @@ from tools.logger.custom_logging import custom_log, log_function_call
 from utils.config.config import Config
 from core.managers.redis_manager import RedisManager
 from datetime import datetime
+import time
 
 class ConnectionAPI:
     def __init__(self, app_manager=None):
@@ -26,53 +27,128 @@ class ConnectionAPI:
         self.app = app
 
     def _create_connection_pool(self):
-        """Create and return a PostgreSQL connection pool."""
+        """Create a PostgreSQL connection pool with security features."""
         try:
-            # Read password from secret file
-            with open(os.getenv("POSTGRES_PASSWORD_FILE"), 'r') as f:
-                db_password = f.read().strip()
+            # Get database credentials from environment
+            db_host = os.getenv("POSTGRES_HOST", "localhost")
+            db_port = os.getenv("POSTGRES_PORT", "5432")
+            db_name = os.getenv("POSTGRES_DB", "postgres")
+            db_user = os.getenv("POSTGRES_USER", "postgres")
+            
+            # Get password from file or environment variable
+            password_file = os.getenv("POSTGRES_PASSWORD_FILE")
+            if password_file and os.path.exists(password_file):
+                with open(password_file, 'r') as f:
+                    db_password = f.read().strip()
+            else:
+                db_password = os.getenv("POSTGRES_PASSWORD")
+            
+            if not db_password:
+                raise ValueError("Database password not found in file or environment variable")
 
+            # Connection parameters with security features
+            connection_params = {
+                "host": db_host,
+                "port": db_port,
+                "database": db_name,
+                "user": db_user,
+                "password": db_password,
+                "connect_timeout": Config.DB_CONNECT_TIMEOUT,
+                "keepalives": Config.DB_KEEPALIVES,
+                "keepalives_idle": Config.DB_KEEPALIVES_IDLE,
+                "keepalives_interval": Config.DB_KEEPALIVES_INTERVAL,
+                "keepalives_count": Config.DB_KEEPALIVES_COUNT,
+                "application_name": "template_three_app"
+            }
+
+            # Add SSL if enabled
+            if Config.USE_SSL:
+                connection_params["sslmode"] = "require"
+
+            # Create connection pool with security features
             pool = psycopg2.pool.SimpleConnectionPool(
                 minconn=Config.DB_POOL_MIN_CONN,
                 maxconn=Config.DB_POOL_MAX_CONN,
-                user=os.getenv("POSTGRES_USER"),
-                password=db_password,
-                host=os.getenv("DB_HOST", "127.0.0.1"),
-                port=os.getenv("DB_PORT", "5432"),
-                database=os.getenv("POSTGRES_DB")
+                **connection_params
             )
-            custom_log(f"✅ Database connection pool created (min: {Config.DB_POOL_MIN_CONN}, max: {Config.DB_POOL_MAX_CONN})")
+
+            # Test the pool with a health check
+            with pool.getconn() as conn:
+                with conn.cursor() as cur:
+                    # Set statement timeout for this connection
+                    cur.execute(f"SET statement_timeout = {Config.DB_STATEMENT_TIMEOUT}")
+                    cur.execute("SELECT 1")
+                    result = cur.fetchone()
+                    if not result or result[0] != 1:
+                        raise RuntimeError("Health check failed")
+
+            custom_log(f"✅ Database connection pool created successfully with security features. Pool size: {Config.DB_POOL_MIN_CONN}-{Config.DB_POOL_MAX_CONN}")
             return pool
+
         except Exception as e:
             custom_log(f"❌ Error creating connection pool: {e}")
-            return None
+            raise RuntimeError(f"Failed to create database connection pool: {str(e)}")
 
     def get_connection(self):
-        """Get a connection from the pool and cache its state in Redis."""
-        if self.connection_pool is None:
-            custom_log("🔄 Recreating connection pool...")
-            self.connection_pool = self._create_connection_pool()
-            if self.connection_pool is None:
-                raise RuntimeError("Failed to create database connection pool")
+        """Get a connection from the pool with retry logic and state tracking."""
+        retry_count = 0
+        last_error = None
 
-        try:
-            connection = self.connection_pool.getconn()
-            connection.autocommit = True  # Prevents transaction blocks from lingering
-            
-            # Cache connection state in Redis
-            conn_id = id(connection)
-            self.redis.client.hset(f"db_connection:{conn_id}", mapping={
-                "created_at": str(datetime.now().isoformat()),
-                "status": "active",
-                "autocommit": "true"
-            })
-            self.redis.client.expire(f"db_connection:{conn_id}", 300)  # Cache for 5 minutes
-            
-            custom_log(f"✅ Got connection from pool (ID: {conn_id})")
-            return connection
-        except Exception as e:
-            custom_log(f"❌ Error getting connection from pool: {e}")
-            raise
+        while retry_count < Config.DB_RETRY_COUNT:
+            try:
+                # Check if pool exists, if not create it
+                if not self.connection_pool:
+                    self.connection_pool = self._create_connection_pool()
+
+                # Get connection from pool with timeout
+                conn = self.connection_pool.getconn()
+                if not conn:
+                    raise RuntimeError("Failed to get connection from pool")
+
+                # Set statement timeout for this connection
+                with conn.cursor() as cur:
+                    cur.execute(f"SET statement_timeout = {Config.DB_STATEMENT_TIMEOUT}")
+
+                # Track connection state in Redis
+                connection_id = id(conn)
+                connection_state = {
+                    "created_at": time.time(),
+                    "status": "active",
+                    "statement_timeout": Config.DB_STATEMENT_TIMEOUT,
+                    "last_used": time.time()
+                }
+                
+                # Cache connection state with expiration
+                self.redis_manager.set(
+                    f"connection:{connection_id}",
+                    json.dumps(connection_state),
+                    expire=Config.DB_KEEPALIVES_IDLE * 2
+                )
+
+                custom_log(f"✅ Got connection from pool (ID: {connection_id})")
+                return conn
+
+            except (psycopg2.OperationalError, RuntimeError) as e:
+                last_error = e
+                retry_count += 1
+                custom_log(f"Connection attempt {retry_count} failed: {str(e)}")
+                
+                if retry_count < Config.DB_RETRY_COUNT:
+                    time.sleep(Config.DB_RETRY_DELAY)
+                    continue
+                
+                # If we've exhausted retries, try to recreate the pool
+                custom_log("Max retries reached, attempting to recreate connection pool")
+                self.connection_pool = self._create_connection_pool()
+                retry_count = 0  # Reset retry count after pool recreation
+                time.sleep(Config.DB_RETRY_DELAY)
+
+            except Exception as e:
+                custom_log(f"Unexpected error getting connection: {str(e)}")
+                raise
+
+        # If we get here, all retries failed
+        raise RuntimeError(f"Failed to get connection after {Config.DB_RETRY_COUNT} attempts. Last error: {str(last_error)}")
 
     def return_connection(self, connection):
         """Return a connection to the pool and update Redis cache."""
@@ -80,11 +156,14 @@ class ConnectionAPI:
             try:
                 conn_id = id(connection)
                 # Update connection state in Redis
-                self.redis.client.hset(f"db_connection:{conn_id}", mapping={
-                    "status": "returned",
-                    "returned_at": str(datetime.now().isoformat())
-                })
-                self.redis.client.expire(f"db_connection:{conn_id}", 300)  # Cache for 5 minutes
+                self.redis_manager.set(
+                    f"connection:{conn_id}",
+                    json.dumps({
+                        "status": "returned",
+                        "returned_at": str(datetime.now().isoformat())
+                    }),
+                    expire=Config.DB_KEEPALIVES_IDLE * 2
+                )
                 
                 self.connection_pool.putconn(connection)
                 custom_log(f"✅ Returned connection to pool (ID: {conn_id})")
@@ -102,7 +181,7 @@ class ConnectionAPI:
             cache_key = f"query:{hash(query + str(params or ()))}"
             
             # Try to get from Redis cache first
-            cached_result = self.redis.client.get(cache_key)
+            cached_result = self.redis_manager.get(cache_key)
             if cached_result:
                 custom_log(f"✅ Retrieved query result from Redis cache")
                 result = json.loads(cached_result)
@@ -123,7 +202,7 @@ class ConnectionAPI:
                 processed_result = [list(row) for row in result]
             
             # Cache the result in Redis for 5 minutes
-            self.redis.client.setex(cache_key, 300, json.dumps(processed_result))
+            self.redis_manager.set(cache_key, json.dumps(processed_result), expire=300)
             custom_log(f"✅ Cached query result in Redis")
             
             # Return original format
@@ -153,7 +232,7 @@ class ConnectionAPI:
             
             # Invalidate any cached results for this query
             cache_key = f"query:{hash(query + str(params or ()))}"
-            self.redis.client.delete(cache_key)
+            self.redis_manager.delete(cache_key)
             
             custom_log("✅ Query executed successfully")
         except psycopg2.Error as e:
@@ -211,13 +290,13 @@ class ConnectionAPI:
     def cache_user_data(self, user_id, data):
         """Cache user data in Redis."""
         cache_key = f"user_data:{user_id}"
-        self.redis.client.setex(cache_key, 300, json.dumps(data))
+        self.redis_manager.set(cache_key, json.dumps(data), expire=300)
         custom_log(f"✅ Cached user data for user {user_id}")
 
     def get_cached_user_data(self, user_id):
         """Get cached user data from Redis."""
         cache_key = f"user_data:{user_id}"
-        data = self.redis.client.get(cache_key)
+        data = self.redis_manager.get(cache_key)
         if data:
             return json.loads(data)
         return None
@@ -225,13 +304,13 @@ class ConnectionAPI:
     def cache_guessed_names(self, user_id, names):
         """Cache guessed names in Redis."""
         cache_key = f"guessed_names:{user_id}"
-        self.redis.client.setex(cache_key, 300, json.dumps(names))
+        self.redis_manager.set(cache_key, json.dumps(names), expire=300)
         custom_log(f"✅ Cached guessed names for user {user_id}")
 
     def get_cached_guessed_names(self, user_id):
         """Get cached guessed names from Redis."""
         cache_key = f"guessed_names:{user_id}"
-        data = self.redis.client.get(cache_key)
+        data = self.redis_manager.get(cache_key)
         if data:
             return json.loads(data)
         return None
@@ -243,7 +322,7 @@ class ConnectionAPI:
         
         # Invalidate guessed names cache
         cache_key = f"guessed_names:{user_id}"
-        self.redis.client.delete(cache_key)
+        self.redis_manager.delete(cache_key)
         custom_log(f"✅ Added guessed name for user {user_id}")
 
     @property
