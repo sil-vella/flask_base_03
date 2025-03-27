@@ -6,6 +6,7 @@ import json
 from tools.logger.custom_logging import custom_log, log_function_call
 from utils.config.config import Config
 from core.managers.redis_manager import RedisManager
+from tools.error_handling import ErrorHandler
 from datetime import datetime
 import time
 
@@ -16,6 +17,7 @@ class ConnectionAPI:
         self.app_manager = app_manager  # Reference to AppManager if provided
         self.connection_pool = self._create_connection_pool()  # Initialize PostgreSQL connection pool
         self.redis_manager = RedisManager()  # Initialize Redis manager
+        self.error_handler = ErrorHandler()  # Initialize error handler
 
         # ✅ Ensure tables exist in the database
         self.initialize_database()
@@ -174,6 +176,13 @@ class ConnectionAPI:
         """Execute a SELECT query and cache results in Redis."""
         connection = None
         try:
+            # Validate query size
+            if not self.error_handler.validate_query_size(query, params):
+                error_response = self.error_handler.handle_validation_error(
+                    ValueError("Query size exceeds maximum allowed size")
+                )
+                raise ValueError(error_response["error"])
+
             connection = self.get_connection()
             cursor = connection.cursor(cursor_factory=psycopg2.extras.DictCursor if as_dict else None)
             
@@ -181,13 +190,17 @@ class ConnectionAPI:
             cache_key = f"query:{hash(query + str(params or ()))}"
             
             # Try to get from Redis cache first
-            cached_result = self.redis_manager.get(cache_key)
-            if cached_result:
-                custom_log(f"✅ Retrieved query result from Redis cache")
-                # Convert list of lists back to list of tuples for non-dict results
-                if not as_dict:
-                    cached_result = [tuple(row) for row in cached_result]
-                return cached_result
+            try:
+                cached_result = self.redis_manager.get(cache_key)
+                if cached_result:
+                    custom_log(f"✅ Retrieved query result from Redis cache")
+                    # Convert list of lists back to list of tuples for non-dict results
+                    if not as_dict:
+                        cached_result = [tuple(row) for row in cached_result]
+                    return cached_result
+            except Exception as e:
+                error_response = self.error_handler.handle_redis_error(e, "cache_get")
+                custom_log(f"⚠️ Cache retrieval failed: {error_response['error']}")
             
             cursor.execute(query, params or ())
             result = cursor.fetchall()
@@ -200,14 +213,19 @@ class ConnectionAPI:
                 processed_result = [tuple(row) for row in result]
             
             # Cache the result
-            self.redis_manager.set(cache_key, processed_result, expire=300)  # Cache for 5 minutes
-            custom_log(f"✅ Cached query result in Redis")
+            try:
+                self.redis_manager.set(cache_key, processed_result, expire=300)  # Cache for 5 minutes
+                custom_log(f"✅ Cached query result in Redis")
+            except Exception as e:
+                error_response = self.error_handler.handle_redis_error(e, "cache_set")
+                custom_log(f"⚠️ Cache storage failed: {error_response['error']}")
             
             return processed_result
             
         except Exception as e:
-            custom_log(f"❌ Error executing query: {e}")
-            raise
+            error_response = self.error_handler.handle_database_error(e, "fetch_from_db")
+            custom_log(f"❌ Error executing query: {error_response['error']}")
+            raise ValueError(error_response["error"])
         finally:
             if connection:
                 self.return_connection(connection)
@@ -216,6 +234,13 @@ class ConnectionAPI:
         """Execute a non-SELECT query and invalidate relevant caches."""
         connection = None
         try:
+            # Validate query size
+            if not self.error_handler.validate_query_size(query, params):
+                error_response = self.error_handler.handle_validation_error(
+                    ValueError("Query size exceeds maximum allowed size")
+                )
+                raise ValueError(error_response["error"])
+
             connection = self.get_connection()
             cursor = connection.cursor()
             cursor.execute(query, params or ())
@@ -228,8 +253,9 @@ class ConnectionAPI:
         except Exception as e:
             if connection:
                 connection.rollback()
-            custom_log(f"❌ Error executing query: {e}")
-            raise
+            error_response = self.error_handler.handle_database_error(e, "execute_query")
+            custom_log(f"❌ Error executing query: {error_response['error']}")
+            raise ValueError(error_response["error"])
         finally:
             if connection:
                 self.return_connection(connection)
@@ -286,19 +312,6 @@ class ConnectionAPI:
         """Get cached user data from Redis with decryption."""
         return self.redis_manager.get(f"user:{user_id}")
 
-    def cache_guessed_names(self, user_id, names):
-        """Cache guessed names in Redis with encryption."""
-        self.redis_manager.set(f"guessed_names:{user_id}", names, expire=3600)  # Cache for 1 hour
-
-    def get_cached_guessed_names(self, user_id):
-        """Get cached guessed names from Redis with decryption."""
-        return self.redis_manager.get(f"guessed_names:{user_id}")
-
-    def add_guessed_name(self, user_id, name):
-        """Add a new guessed name and invalidate cache."""
-        # Invalidate cache to force fresh data fetch
-        self.redis_manager.delete(f"guessed_names:{user_id}")
-
     @property
     def redis(self):
         """Access Redis manager methods directly."""
@@ -315,13 +328,6 @@ class ConnectionAPI:
         # Invalidate user data cache if user-related query
         if "users" in query:
             pattern = "user:*"
-            keys = self.redis_manager.redis.keys(pattern)
-            for key in keys:
-                self.redis_manager.delete(key)
-        
-        # Invalidate guessed names cache if guessed_names-related query
-        if "guessed_names" in query:
-            pattern = "guessed_names:*"
             keys = self.redis_manager.redis.keys(pattern)
             for key in keys:
                 self.redis_manager.delete(key)
