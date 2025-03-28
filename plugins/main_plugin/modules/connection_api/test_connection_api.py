@@ -14,6 +14,24 @@ class TestConnectionAPI(unittest.TestCase):
         self.connection_api = ConnectionAPI()
         self.redis_manager = RedisManager()
         
+        # Clear any existing sessions
+        pattern = "session:*"
+        session_keys = self.redis_manager.redis.keys(pattern)
+        for key in session_keys:
+            self.redis_manager.redis.delete(key)
+            
+        # Clear any existing user session sets
+        pattern = "user_sessions:*"
+        set_keys = self.redis_manager.redis.keys(pattern)
+        for key in set_keys:
+            self.redis_manager.redis.delete(key)
+            
+        # Verify cleanup
+        session_count = len(self.redis_manager.redis.keys("session:*"))
+        set_count = len(self.redis_manager.redis.keys("user_sessions:*"))
+        self.assertEqual(session_count, 0, "Failed to clean up sessions")
+        self.assertEqual(set_count, 0, "Failed to clean up user session sets")
+        
     def test_redis_encryption(self):
         """Test Redis data encryption and decryption."""
         try:
@@ -206,6 +224,59 @@ class TestConnectionAPI(unittest.TestCase):
         except Exception as e:
             self.error_handler.handle_error(e)
             raise
+
+    def test_session_management(self):
+        """Test session management features."""
+        # Test session creation
+        user_id = 1
+        session_id = self.connection_api._create_session(user_id)
+        self.assertIsNotNone(session_id)
+        self.assertTrue(session_id.startswith(f"session:{user_id}:"))
+        
+        # Test session validation
+        session_data = self.connection_api._validate_session(session_id)
+        self.assertIsNotNone(session_data)
+        self.assertEqual(session_data["user_id"], user_id)
+        
+        # Test concurrent session limit
+        # We already have one session, so create max_concurrent_sessions - 1 more
+        for _ in range(self.connection_api.max_concurrent_sessions - 1):
+            self.connection_api._create_session(user_id)
+        
+        # Try to create one more session (should fail)
+        with self.assertRaises(ValueError):
+            self.connection_api._create_session(user_id)
+        
+        # Test session activity update
+        self.assertTrue(self.connection_api._update_session_activity(session_id))
+        
+        # Test session info retrieval
+        session_info = self.connection_api._get_session_info(session_id)
+        self.assertIsNotNone(session_info)
+        self.assertEqual(session_info["user_id"], user_id)
+        self.assertIn("created_at", session_info)
+        self.assertIn("last_activity", session_info)
+        
+        # Test session termination
+        self.connection_api._terminate_session(session_id)
+        self.assertIsNone(self.connection_api._validate_session(session_id))
+        
+        # Test user sessions termination
+        self.connection_api._terminate_user_sessions(user_id)
+        active_sessions = self.connection_api._get_active_sessions(user_id)
+        self.assertEqual(len(active_sessions), 0)
+        
+        # Test expired session cleanup
+        # Create a session with very short timeout
+        self.connection_api.session_timeout = 1
+        session_id = self.connection_api._create_session(user_id)
+        time.sleep(2)  # Wait for session to expire
+        self.connection_api._cleanup_expired_sessions()
+        active_sessions = self.connection_api._get_active_sessions(user_id)
+        self.assertEqual(len(active_sessions), 0)
+        
+        # Reset timeout
+        self.connection_api.session_timeout = 3600
 
     def tearDown(self):
         """Clean up after each test."""
