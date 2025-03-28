@@ -176,6 +176,21 @@ class ConnectionAPI:
         """Execute a SELECT query and cache results in Redis."""
         connection = None
         try:
+            # Validate query type and format
+            if not query or not isinstance(query, str):
+                raise ValueError("Invalid query format")
+                
+            # Validate query is SELECT
+            if not query.strip().upper().startswith('SELECT'):
+                raise ValueError("Only SELECT queries are allowed in fetch_from_db")
+                
+            # Validate parameters
+            if params is not None:
+                if not isinstance(params, (tuple, list)):
+                    raise ValueError("Parameters must be a tuple or list")
+                if any(not isinstance(p, (str, int, float, bool, type(None))) for p in params):
+                    raise ValueError("Invalid parameter types")
+
             # Validate query size
             if not self.error_handler.validate_query_size(query, params):
                 error_response = self.error_handler.handle_validation_error(
@@ -211,6 +226,13 @@ class ConnectionAPI:
                 processed_result = [dict(row) for row in result]
             else:
                 processed_result = [tuple(row) for row in result]
+            
+            # Validate result size before caching
+            MAX_RESULT_SIZE = 1024 * 1024  # 1MB
+            result_size = len(json.dumps(processed_result))
+            if result_size > MAX_RESULT_SIZE:
+                custom_log("⚠️ Query result too large for caching")
+                return processed_result
             
             # Cache the result
             try:
@@ -306,11 +328,61 @@ class ConnectionAPI:
 
     def cache_user_data(self, user_id, data):
         """Cache user data in Redis with encryption."""
+        # Validate user_id
+        if not isinstance(user_id, (int, str)) or not str(user_id).isdigit():
+            raise ValueError("Invalid user_id")
+        
+        # Validate data structure
+        if not isinstance(data, dict):
+            raise ValueError("Data must be a dictionary")
+        
+        # Validate required fields
+        required_fields = ['id', 'username', 'email']
+        if not all(field in data for field in required_fields):
+            raise ValueError("Missing required user data fields")
+        
+        # Validate data size
+        data_size = len(json.dumps(data))
+        if data_size > 1024 * 1024:  # 1MB limit
+            raise ValueError("User data too large for caching")
+        
+        # Validate data types
+        if not isinstance(data['id'], (int, str)) or not str(data['id']).isdigit():
+            raise ValueError("Invalid user ID in data")
+        if not isinstance(data['username'], str) or len(data['username']) > 50:
+            raise ValueError("Invalid username format")
+        if not isinstance(data['email'], str) or '@' not in data['email']:
+            raise ValueError("Invalid email format")
+        
         self.redis_manager.set(f"user:{user_id}", data, expire=3600)  # Cache for 1 hour
 
     def get_cached_user_data(self, user_id):
         """Get cached user data from Redis with decryption."""
-        return self.redis_manager.get(f"user:{user_id}")
+        # Validate user_id
+        if not isinstance(user_id, (int, str)) or not str(user_id).isdigit():
+            raise ValueError("Invalid user_id")
+        
+        # Get cached data
+        data = self.redis_manager.get(f"user:{user_id}")
+        
+        # Validate cached data structure
+        if data:
+            if not isinstance(data, dict):
+                self.redis_manager.delete(f"user:{user_id}")  # Clear invalid data
+                return None
+                
+            # Validate required fields
+            required_fields = ['id', 'username', 'email']
+            if not all(field in data for field in required_fields):
+                self.redis_manager.delete(f"user:{user_id}")  # Clear invalid data
+                return None
+                
+            # Validate data types
+            if not isinstance(data['id'], (int, str)) or not str(data['id']).isdigit():
+                self.redis_manager.delete(f"user:{user_id}")  # Clear invalid data
+                return None
+        
+        return data
 
     @property
     def redis(self):
