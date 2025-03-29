@@ -2,11 +2,18 @@ from flask import request
 from core.managers.websocket_manager import WebSocketManager
 from tools.logger.custom_logging import custom_log
 from typing import Dict, Any
+from flask_cors import CORS
 
 class WebSocketModule:
-    def __init__(self, websocket_manager: WebSocketManager):
-        self.websocket_manager = websocket_manager
+    def __init__(self, app_manager=None):
+        self.app_manager = app_manager
+        self.websocket_manager = WebSocketManager()
+        if app_manager and app_manager.flask_app:
+            self.websocket_manager.initialize(app_manager.flask_app)
         self._register_handlers()
+        self.button_counter_room = "button_counter_room"
+        # Configure CORS for WebSocket
+        self.websocket_manager.socketio.cors_allowed_origins = "*"
         custom_log("WebSocketModule initialized")
 
     def _register_handlers(self):
@@ -16,11 +23,14 @@ class WebSocketModule:
         self.websocket_manager.register_handler('join', self._handle_join)
         self.websocket_manager.register_handler('leave', self._handle_leave)
         self.websocket_manager.register_handler('message', self._handle_message)
+        self.websocket_manager.register_handler('button_press', self._handle_button_press)
         custom_log("WebSocket event handlers registered")
 
-    def _handle_connect(self):
+    def _handle_connect(self, data=None):
         """Handle new WebSocket connections."""
         session_id = request.sid
+        # Automatically join the button counter room
+        self.websocket_manager.join_room(self.button_counter_room, session_id)
         custom_log(f"New WebSocket connection: {session_id}")
         return {'status': 'connected', 'session_id': session_id}
 
@@ -73,6 +83,24 @@ class WebSocketModule:
             })
         
         return {'status': 'sent'}
+
+    def _handle_button_press(self, data: Dict[str, Any]):
+        """Handle button press events."""
+        custom_log(f"Received button_press event with data: {data}")
+        if not data:
+            custom_log("Received button_press event with no data")
+            return {'status': 'error', 'message': 'No data provided'}
+            
+        count = data.get('count', 0)
+        custom_log(f"Button pressed, count: {count}")
+        
+        # Broadcast the new count to all clients in the button counter room
+        custom_log(f"Broadcasting to room {self.button_counter_room}")
+        self.websocket_manager.broadcast_to_room(self.button_counter_room, 'button_pressed', {
+            'count': count
+        })
+        custom_log("Broadcast completed")
+        return {'status': 'broadcasted', 'count': count}
 
     def broadcast_to_room(self, room_id: str, event: str, data: Any):
         """Broadcast a message to all clients in a room."""

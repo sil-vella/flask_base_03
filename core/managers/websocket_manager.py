@@ -5,7 +5,12 @@ from tools.logger.custom_logging import custom_log
 
 class WebSocketManager:
     def __init__(self):
-        self.socketio = SocketIO(cors_allowed_origins="*", async_mode='threading')
+        self.socketio = SocketIO(
+            cors_allowed_origins="*",
+            async_mode='gevent',
+            logger=True,
+            engineio_logger=True
+        )
         self.rooms: Dict[str, Set[str]] = {}  # room_id -> set of session_ids
         self.session_rooms: Dict[str, Set[str]] = {}  # session_id -> set of room_ids
         custom_log("WebSocketManager initialized")
@@ -18,9 +23,12 @@ class WebSocketManager:
     def register_handler(self, event: str, handler: Callable):
         """Register a WebSocket event handler."""
         @self.socketio.on(event)
-        def wrapped_handler(*args, **kwargs):
+        def wrapped_handler(data=None):
             try:
-                return handler(*args, **kwargs)
+                custom_log(f"Received {event} event with data: {data}")
+                result = handler(data)
+                custom_log(f"Handler result for {event}: {result}")
+                return result
             except Exception as e:
                 custom_log(f"Error in WebSocket handler {event}: {str(e)}")
                 emit('error', {'message': str(e)})
@@ -63,7 +71,7 @@ class WebSocketManager:
     def broadcast_to_room(self, room_id: str, event: str, data: Any):
         """Broadcast a message to all clients in a room."""
         if room_id in self.rooms:
-            emit(event, data, room=room_id)
+            emit(event, data, room=room_id, broadcast=True)
             custom_log(f"Broadcast {event} to room {room_id}")
 
     def send_to_session(self, session_id: str, event: str, data: Any):

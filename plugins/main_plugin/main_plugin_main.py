@@ -1,5 +1,6 @@
 from plugins.main_plugin.modules.connection_api.connection_api import ConnectionAPI
 from plugins.main_plugin.modules.login_module.login_module import LoginModule
+from plugins.main_plugin.modules.websocket_module.websocket_module import WebSocketModule
 
 class MainPlugin:
     def initialize(self, app_manager):
@@ -25,6 +26,15 @@ class MainPlugin:
                 raise Exception("ConnectionAPI is not registered in ModuleManager.")
 
             connection_api.initialize(app_manager.flask_app)
+
+            # Register WebSocket Module
+            if not app_manager.module_manager.get_module("websocket_module"):
+                print("Registering WebSocket Module...")
+                app_manager.module_manager.register_module(
+                    "websocket_module",
+                    WebSocketModule,
+                    app_manager=app_manager
+                )
 
             # Ensure LoginModule is registered LAST
             if not app_manager.module_manager.get_module("login_module"):

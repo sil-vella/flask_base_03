@@ -6,7 +6,7 @@ import inspect
 import types
 import re
 # Flags to enable or disable specific logging functionalities
-CUSTOM_LOGGING_ENABLED = False
+CUSTOM_LOGGING_ENABLED = True
 GAMEPLAY_LOGGING_ENABLED = False
 FUNCTION_LOGGING_ENABLED = False
 
