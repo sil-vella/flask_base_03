@@ -2,6 +2,7 @@ from core.managers.plugin_manager import PluginManager
 from core.managers.service_manager import ServicesManager
 from core.managers.hooks_manager import HooksManager
 from core.managers.module_manager import ModuleManager
+from core.managers.websocket_manager import WebSocketManager
 from jinja2 import ChoiceLoader, FileSystemLoader
 from tools.logger.custom_logging import custom_log, function_log, game_play_log, log_function_call
 import os
@@ -14,6 +15,7 @@ class AppManager:
         self.services_manager = ServicesManager()
         self.hooks_manager = HooksManager()
         self.module_manager = ModuleManager()
+        self.websocket_manager = WebSocketManager()
         self.template_dirs = []  # List to track template directories
         self.flask_app = None  # Flask app reference
 
@@ -34,6 +36,8 @@ class AppManager:
         # Initialize services
         self.services_manager.initialize_services()
 
+        # Initialize WebSocket support
+        self.websocket_manager.initialize(app)
 
         # Register and initialize plugins
         custom_log("Initializing plugins...")
@@ -41,6 +45,10 @@ class AppManager:
 
         # Update the Jinja loader with template directories
         self._update_jinja_loader()
+
+    def run(self, **kwargs):
+        """Run the application with WebSocket support."""
+        self.websocket_manager.run(self.flask_app, **kwargs)
 
     @log_function_call
     def get_plugins_path(self, return_url=False):

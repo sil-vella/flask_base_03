@@ -23,4 +23,5 @@ app_manager.initialize(app)
 app.config["DEBUG"] = True
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000)
+    # Run with WebSocket support
+    app_manager.run(host='0.0.0.0', port=5000)

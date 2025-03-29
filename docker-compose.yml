@@ -58,7 +58,8 @@ services:
     command: >
       sh -c "
       pip install --no-cache-dir -r /app/requirements.txt &&
-      gunicorn -b 0.0.0.0:${FLASK_PORT} app:app
+      pip install --no-cache-dir gevent &&
+      gunicorn -b 0.0.0.0:${FLASK_PORT} --worker-class gevent app:app
       "
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${FLASK_PORT}"]
