@@ -11,18 +11,17 @@ class WebSocketModule:
 
     def _register_handlers(self):
         """Register all WebSocket event handlers."""
-        self.websocket_manager.register_handler('connect')(self._handle_connect)
-        self.websocket_manager.register_handler('disconnect')(self._handle_disconnect)
-        self.websocket_manager.register_handler('join')(self._handle_join)
-        self.websocket_manager.register_handler('leave')(self._handle_leave)
-        self.websocket_manager.register_handler('message')(self._handle_message)
+        self.websocket_manager.register_handler('connect', self._handle_connect)
+        self.websocket_manager.register_handler('disconnect', self._handle_disconnect)
+        self.websocket_manager.register_handler('join', self._handle_join)
+        self.websocket_manager.register_handler('leave', self._handle_leave)
+        self.websocket_manager.register_handler('message', self._handle_message)
         custom_log("WebSocket event handlers registered")
 
     def _handle_connect(self):
         """Handle new WebSocket connections."""
         session_id = request.sid
         custom_log(f"New WebSocket connection: {session_id}")
-        # You can add authentication here if needed
         return {'status': 'connected', 'session_id': session_id}
 
     def _handle_disconnect(self):
@@ -89,4 +88,4 @@ class WebSocketModule:
 
     def get_rooms_for_session(self, session_id: str) -> set:
         """Get all rooms a session is in."""
-        return self.websocket_manager.get_rooms_for_session(session_id) 
+        return self.websocket_manager.get_rooms_for_session(session_id)

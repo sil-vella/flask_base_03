@@ -46,9 +46,9 @@ class AppManager:
         # Update the Jinja loader with template directories
         self._update_jinja_loader()
 
-    def run(self, **kwargs):
-        """Run the application with WebSocket support."""
-        self.websocket_manager.run(self.flask_app, **kwargs)
+    def run(self, app, **kwargs):
+        """Run the Flask application with WebSocket support."""
+        self.websocket_manager.run(app, **kwargs)
 
     @log_function_call
     def get_plugins_path(self, return_url=False):
