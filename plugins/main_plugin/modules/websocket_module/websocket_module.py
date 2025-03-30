@@ -1,6 +1,7 @@
 from flask import request
 from core.managers.websocket_manager import WebSocketManager
 from core.managers.redis_manager import RedisManager
+from core.managers.jwt_manager import JWTManager, TokenType
 from tools.logger.custom_logging import custom_log
 from typing import Dict, Any, Optional
 from flask_cors import CORS
@@ -14,6 +15,7 @@ class WebSocketModule:
         self.app_manager = app_manager
         self.websocket_manager = WebSocketManager()
         self.redis_manager = RedisManager()
+        self.jwt_manager = JWTManager()  # Initialize JWT manager
         if app_manager and app_manager.flask_app:
             self.websocket_manager.initialize(app_manager.flask_app)
         
@@ -43,11 +45,30 @@ class WebSocketModule:
         self.websocket_manager.register_handler('button_press', self._handle_button_press)
         custom_log("WebSocket event handlers registered")
 
+    def _validate_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """Validate JWT token and return user data if valid."""
+        try:
+            # Validate the token
+            payload = self.jwt_manager.verify_token(token, TokenType.ACCESS)
+            if not payload:
+                return None
+                
+            # Get user data from Redis cache
+            user_data = self.redis_manager.get(f"user:{payload['user_id']}")
+            if not user_data:
+                return None
+                
+            return user_data
+        except Exception as e:
+            custom_log(f"Token validation error: {str(e)}")
+            return None
+
     def _handle_connect(self, data=None):
         """Handle new WebSocket connections with security checks."""
         session_id = request.sid
         origin = request.headers.get('Origin', '')
         client_id = request.headers.get('X-Client-ID', session_id)
+        token = request.args.get('token')  # Get token from query parameters
         
         # For testing, allow all origins
         if origin == 'null' or not origin:
@@ -63,16 +84,33 @@ class WebSocketModule:
             custom_log(f"Rate limit exceeded for client: {client_id}")
             return {'status': 'error', 'message': 'Rate limit exceeded'}
             
+        # Validate JWT token
+        if not token:
+            custom_log("No token provided for WebSocket connection")
+            return {'status': 'error', 'message': 'Authentication required'}
+            
+        user_data = self._validate_token(token)
+        if not user_data:
+            custom_log("Invalid token for WebSocket connection")
+            return {'status': 'error', 'message': 'Invalid authentication'}
+            
         # Update rate limits
         self.websocket_manager.update_rate_limit(client_id, 'connections')
         
-        # Store session info
-        self.websocket_manager.store_session_data(session_id, client_id, origin)
+        # Store session info with user data
+        session_data = {
+            'client_id': client_id,
+            'origin': origin,
+            'user_id': user_data['id'],
+            'connected_at': datetime.utcnow().isoformat(),
+            'last_active': datetime.utcnow().isoformat()
+        }
+        self.websocket_manager.store_session_data(session_id, session_data)
         
         # Join button counter room
         self.websocket_manager.join_room(self.button_counter_room, session_id)
         
-        custom_log(f"New WebSocket connection: {session_id} from {origin}")
+        custom_log(f"New WebSocket connection: {session_id} from {origin} for user {user_data['id']}")
         return {'status': 'connected', 'session_id': session_id}
 
     def _handle_disconnect(self, data=None):
@@ -87,90 +125,109 @@ class WebSocketModule:
         custom_log(f"WebSocket disconnected: {session_id}")
 
     def _handle_join(self, data: Dict[str, Any]):
-        """Handle joining a room."""
+        """Handle joining a room with authentication."""
         session_id = request.sid
         room_id = data.get('room_id')
         if not room_id:
             raise ValueError("room_id is required")
+            
+        # Get session data and validate user
+        session_data = self.websocket_manager.get_session_data(session_id)
+        if not session_data or 'user_id' not in session_data:
+            return {'status': 'error', 'message': 'Authentication required'}
         
         self.websocket_manager.join_room(room_id, session_id)
         return {'status': 'joined', 'room_id': room_id}
 
     def _handle_leave(self, data: Dict[str, Any]):
-        """Handle leaving a room."""
+        """Handle leaving a room with authentication."""
         session_id = request.sid
         room_id = data.get('room_id')
         if not room_id:
             raise ValueError("room_id is required")
+            
+        # Get session data and validate user
+        session_data = self.websocket_manager.get_session_data(session_id)
+        if not session_data or 'user_id' not in session_data:
+            return {'status': 'error', 'message': 'Authentication required'}
         
         self.websocket_manager.leave_room(room_id, session_id)
         return {'status': 'left', 'room_id': room_id}
 
     def _handle_message(self, data: Dict[str, Any]):
-        """Handle incoming messages with rate limiting."""
+        """Handle incoming messages with authentication."""
         session_id = request.sid
-        client_id = request.headers.get('X-Client-ID', session_id)
+        message = data.get('message')
+        room_id = data.get('room_id')
         
-        # Check message rate limit
-        if not self.websocket_manager.check_rate_limit(client_id, 'messages'):
-            return {'status': 'error', 'message': 'Message rate limit exceeded'}
+        if not message:
+            raise ValueError("message is required")
             
-        # Update message rate limit
-        self.websocket_manager.update_rate_limit(client_id, 'messages')
+        # Get session data and validate user
+        session_data = self.websocket_manager.get_session_data(session_id)
+        if not session_data or 'user_id' not in session_data:
+            return {'status': 'error', 'message': 'Authentication required'}
+            
+        # Check rate limits for messages
+        if not self.websocket_manager.check_rate_limit(session_data['client_id'], 'messages'):
+            return {'status': 'error', 'message': 'Rate limit exceeded'}
+            
+        # Update rate limits
+        self.websocket_manager.update_rate_limit(session_data['client_id'], 'messages')
         
         # Update session activity
         self.websocket_manager.update_session_activity(session_id)
         
-        # Process message
-        room_id = data.get('room_id')
-        message = data.get('message')
-        
-        if not message:
-            raise ValueError("message is required")
-        
+        # Broadcast message to room or all connected clients
         if room_id:
             self.websocket_manager.broadcast_to_room(room_id, 'message', {
-                'session_id': session_id,
-                'message': message
+                'message': message,
+                'user_id': session_data['user_id'],
+                'timestamp': datetime.utcnow().isoformat()
             })
         else:
-            self.websocket_manager.send_to_session(session_id, 'message', {
-                'session_id': session_id,
-                'message': message
+            self.websocket_manager.broadcast_to_all('message', {
+                'message': message,
+                'user_id': session_data['user_id'],
+                'timestamp': datetime.utcnow().isoformat()
             })
-        
+            
         return {'status': 'sent'}
 
-    def _handle_button_press(self, data: Dict[str, Any]):
-        """Handle button press events."""
-        custom_log(f"Received button_press event with data: {data}")
-        if not data:
-            custom_log("Received button_press event with no data")
-            return {'status': 'error', 'message': 'No data provided'}
+    def _handle_button_press(self, data: Dict[str, Any] = None):
+        """Handle button press events with authentication."""
+        session_id = request.sid
+        
+        # Get session data and validate user
+        session_data = self.websocket_manager.get_session_data(session_id)
+        if not session_data or 'user_id' not in session_data:
+            return {'status': 'error', 'message': 'Authentication required'}
             
-        count = data.get('count', 0)
-        custom_log(f"Button pressed, count: {count}")
-            
-        # Broadcast the new count to all clients in the button counter room
-        custom_log(f"Broadcasting to room {self.button_counter_room}")
-        self.websocket_manager.broadcast_to_room(self.button_counter_room, 'button_pressed', {
-            'count': count
-        })
-        custom_log("Broadcast completed")
-        return {'status': 'success', 'count': count}
+        # Update counter in Redis
+        counter_key = f"button_counter:{self.button_counter_room}"
+        current_count = self.redis_manager.incr(counter_key)
+        
+        # Broadcast updated count to room
+        self.websocket_manager.broadcast_to_room(
+            self.button_counter_room,
+            'counter_update',
+            {'count': current_count}
+        )
+        
+        return {'status': 'success', 'count': current_count}
 
     def broadcast_to_room(self, room_id: str, event: str, data: Any):
-        """Broadcast a message to all clients in a room."""
+        """Broadcast message to a specific room."""
         self.websocket_manager.broadcast_to_room(room_id, event, data)
 
     def send_to_session(self, session_id: str, event: str, data: Any):
-        """Send a message to a specific client."""
+        """Send message to a specific session."""
         self.websocket_manager.send_to_session(session_id, event, data)
 
     def get_room_members(self, room_id: str) -> set:
-        """Get all session IDs in a room."""
+        """Get all members in a room."""
         return self.websocket_manager.get_room_members(room_id)
 
     def get_rooms_for_session(self, session_id: str) -> set:
-        """Get all rooms a session is in."""
+        """Get all rooms for a session."""
         return self.websocket_manager.get_rooms_for_session(session_id)

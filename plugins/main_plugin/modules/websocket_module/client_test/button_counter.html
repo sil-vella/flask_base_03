@@ -39,12 +39,17 @@
             border-radius: 5px;
             cursor: pointer;
             transition: background-color 0.3s;
+            margin: 5px;
         }
         button:hover {
             background-color: #1976D2;
         }
         button:active {
             transform: scale(0.98);
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
         }
         .status {
             margin-top: 20px;
@@ -75,18 +80,59 @@
             color: #C62828;
             font-weight: bold;
         }
+        .login-form {
+            margin: 20px 0;
+            padding: 20px;
+            background-color: #f8f9fa;
+            border-radius: 5px;
+        }
+        .login-form input {
+            padding: 8px;
+            margin: 5px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .user-info {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: #E3F2FD;
+            border-radius: 5px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>WebSocket Button Counter</h1>
-        <div class="counter" id="counter">0</div>
-        <button id="pressButton">Press Me!</button>
-        <div class="status" id="status">Connecting...</div>
+        
+        <!-- Login Form -->
+        <div id="loginForm" class="login-form">
+            <h2>Login</h2>
+            <input type="email" id="email" placeholder="Email" value="test@example.com">
+            <input type="password" id="password" placeholder="Password" value="testpass123">
+            <button onclick="login()">Login</button>
+        </div>
+
+        <!-- User Info -->
+        <div id="userInfo" class="user-info" style="display: none;">
+            <p>Logged in as: <span id="username"></span></p>
+            <button onclick="logout()">Logout</button>
+        </div>
+
+        <!-- Counter Section -->
+        <div id="counterSection" style="display: none;">
+            <div class="counter" id="counter">0</div>
+            <button id="pressButton">Press Me!</button>
+        </div>
+
+        <div class="status" id="status">Not connected</div>
         <div id="debug"></div>
     </div>
 
     <script>
+        let socket = null;
+        let accessToken = null;
+        let refreshToken = null;
+
         function log(message, isError = false) {
             const debug = document.getElementById('debug');
             const time = new Date().toLocaleTimeString();
@@ -95,86 +141,154 @@
             debug.scrollTop = debug.scrollHeight;
         }
 
-        // Generate a unique client ID for rate limiting
-        const clientId = 'test_client_' + Math.random().toString(36).substr(2, 9);
+        async function login() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
 
-        const socket = io('http://localhost:5000', {
-            transports: ['websocket'],
-            reconnection: true,
-            reconnectionAttempts: 5,
-            reconnectionDelay: 1000,
-            forceNew: true,
-            autoConnect: true,
-            extraHeaders: {
-                'X-Client-ID': clientId,
-                'Origin': 'http://localhost:5000'
+            try {
+                const response = await fetch('http://localhost:5000/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    },
+                    body: JSON.stringify({ email, password })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                accessToken = data.access_token;
+                refreshToken = data.refresh_token;
+                document.getElementById('username').textContent = data.user.username;
+                
+                // Show user info and counter section
+                document.getElementById('loginForm').style.display = 'none';
+                document.getElementById('userInfo').style.display = 'block';
+                document.getElementById('counterSection').style.display = 'block';
+                
+                // Connect to WebSocket
+                connectWebSocket();
+                
+                log('Login successful');
+            } catch (error) {
+                log('Login failed: ' + error.message, true);
+                if (error.message.includes('Failed to fetch')) {
+                    log('Make sure the server is running at http://localhost:5000', true);
+                }
             }
-        });
+        }
 
-        const counterElement = document.getElementById('counter');
-        const buttonElement = document.getElementById('pressButton');
-        const statusElement = document.getElementById('status');
-        let pressCount = 0;
+        async function logout() {
+            try {
+                const response = await fetch('http://localhost:5000/logout', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Accept': 'application/json'
+                    },
+                    body: JSON.stringify({ user_id: 1 }) // In a real app, get this from the token
+                });
 
-        // Connect to WebSocket
-        socket.on('connect', () => {
-            log(`Connected to WebSocket server (Client ID: ${clientId})`);
-            statusElement.textContent = 'Connected to WebSocket server';
-            statusElement.className = 'status connected';
-        });
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
 
-        socket.on('disconnect', () => {
-            log('Disconnected from WebSocket server');
-            statusElement.textContent = 'Disconnected from WebSocket server';
-            statusElement.className = 'status disconnected';
-        });
+                const data = await response.json();
+                
+                if (data.error) {
+                    throw new Error(data.error);
+                }
 
-        socket.on('connect_error', (error) => {
-            log(`Connection error: ${error.message}`, true);
-            if (error.message.includes('Rate limit exceeded')) {
-                statusElement.textContent = 'Rate limit exceeded. Please wait.';
-                statusElement.className = 'status disconnected';
+                // Disconnect WebSocket
+                if (socket) {
+                    socket.disconnect();
+                    socket = null;
+                }
+                
+                // Clear tokens
+                accessToken = null;
+                refreshToken = null;
+                
+                // Reset UI
+                document.getElementById('loginForm').style.display = 'block';
+                document.getElementById('userInfo').style.display = 'none';
+                document.getElementById('counterSection').style.display = 'none';
+                document.getElementById('counter').textContent = '0';
+                
+                log('Logged out successfully');
+            } catch (error) {
+                log('Logout failed: ' + error.message, true);
+                if (error.message.includes('Failed to fetch')) {
+                    log('Make sure the server is running at http://localhost:5000', true);
+                }
             }
-        });
+        }
 
-        // Listen for button press events from other users
-        socket.on('button_pressed', (data) => {
-            log(`Received button_pressed event: ${JSON.stringify(data)}`);
-            if (data && typeof data.count !== 'undefined') {
-                pressCount = data.count;
-                counterElement.textContent = pressCount;
+        function connectWebSocket() {
+            if (!accessToken) {
+                log('No access token available', true);
+                return;
             }
-        });
 
-        // Handle button click with rate limiting check
-        buttonElement.addEventListener('click', () => {
-            log(`Emitting button_press event`);
-            socket.emit('button_press', { count: pressCount + 1 }, (response) => {
-                if (response && response.status === 'error') {
-                    log(`Server error: ${response.message}`, true);
-                    if (response.message.includes('Rate limit exceeded')) {
-                        statusElement.textContent = 'Rate limit exceeded. Please wait.';
-                        statusElement.className = 'status disconnected';
-                    }
-                } else if (response && response.status === 'success') {
-                    log(`Server response: ${JSON.stringify(response)}`);
-                    pressCount = response.count;
-                    counterElement.textContent = pressCount;
+            // Disconnect existing socket if any
+            if (socket) {
+                socket.disconnect();
+            }
+
+            // Connect with JWT token
+            socket = io('http://localhost:5000', {
+                query: {
+                    token: accessToken
                 }
             });
-        });
 
-        // Log all events for debugging
-        socket.onAny((event, ...args) => {
-            log(`Received event: ${event} - ${JSON.stringify(args)}`);
-        });
+            socket.on('connect', () => {
+                log('Connected to WebSocket server');
+                document.getElementById('status').textContent = 'Connected';
+                document.getElementById('status').className = 'status connected';
+            });
 
-        // Handle rate limit errors
-        socket.on('error', (error) => {
-            log(`Error: ${error.message}`, true);
-            if (error.message.includes('Rate limit exceeded')) {
-                statusElement.textContent = 'Rate limit exceeded. Please wait.';
-                statusElement.className = 'status disconnected';
+            socket.on('disconnect', () => {
+                log('Disconnected from WebSocket server');
+                document.getElementById('status').textContent = 'Disconnected';
+                document.getElementById('status').className = 'status disconnected';
+            });
+
+            socket.on('connect_error', (error) => {
+                log('Connection error: ' + error.message, true);
+            });
+
+            socket.on('counter_update', (data) => {
+                document.getElementById('counter').textContent = data.count;
+                log('Counter updated: ' + data.count);
+            });
+
+            socket.on('error', (error) => {
+                log('WebSocket error: ' + error.message, true);
+            });
+        }
+
+        // Button press handler
+        document.getElementById('pressButton').addEventListener('click', () => {
+            if (socket && socket.connected) {
+                socket.emit('button_press', {}, (response) => {
+                    if (response && response.status === 'error') {
+                        log('Error: ' + response.message, true);
+                    } else if (response && response.status === 'success') {
+                        log('Button pressed successfully. Count: ' + response.count);
+                    }
+                });
+            } else {
+                log('Not connected to server', true);
             }
         });
     </script>
