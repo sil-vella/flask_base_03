@@ -71,6 +71,10 @@
             max-height: 200px;
             overflow-y: auto;
         }
+        .error {
+            color: #C62828;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
@@ -83,12 +87,16 @@
     </div>
 
     <script>
-        function log(message) {
+        function log(message, isError = false) {
             const debug = document.getElementById('debug');
             const time = new Date().toLocaleTimeString();
-            debug.innerHTML += `[${time}] ${message}<br>`;
+            const logClass = isError ? 'error' : '';
+            debug.innerHTML += `<span class="${logClass}">[${time}] ${message}</span><br>`;
             debug.scrollTop = debug.scrollHeight;
         }
+
+        // Generate a unique client ID for rate limiting
+        const clientId = 'test_client_' + Math.random().toString(36).substr(2, 9);
 
         const socket = io('http://localhost:5000', {
             transports: ['websocket'],
@@ -96,7 +104,11 @@
             reconnectionAttempts: 5,
             reconnectionDelay: 1000,
             forceNew: true,
-            autoConnect: true
+            autoConnect: true,
+            extraHeaders: {
+                'X-Client-ID': clientId,
+                'Origin': 'http://localhost:5000'
+            }
         });
 
         const counterElement = document.getElementById('counter');
@@ -106,7 +118,7 @@
 
         // Connect to WebSocket
         socket.on('connect', () => {
-            log('Connected to WebSocket server');
+            log(`Connected to WebSocket server (Client ID: ${clientId})`);
             statusElement.textContent = 'Connected to WebSocket server';
             statusElement.className = 'status connected';
         });
@@ -118,7 +130,11 @@
         });
 
         socket.on('connect_error', (error) => {
-            log(`Connection error: ${error.message}`);
+            log(`Connection error: ${error.message}`, true);
+            if (error.message.includes('Rate limit exceeded')) {
+                statusElement.textContent = 'Rate limit exceeded. Please wait.';
+                statusElement.className = 'status disconnected';
+            }
         });
 
         // Listen for button press events from other users
@@ -130,19 +146,36 @@
             }
         });
 
-        // Handle button click
+        // Handle button click with rate limiting check
         buttonElement.addEventListener('click', () => {
-            pressCount++;
-            const data = { count: pressCount };
-            log(`Emitting button_press event: ${JSON.stringify(data)}`);
-            socket.emit('button_press', data, (response) => {
-                log(`Server response: ${JSON.stringify(response)}`);
+            log(`Emitting button_press event`);
+            socket.emit('button_press', { count: pressCount + 1 }, (response) => {
+                if (response && response.status === 'error') {
+                    log(`Server error: ${response.message}`, true);
+                    if (response.message.includes('Rate limit exceeded')) {
+                        statusElement.textContent = 'Rate limit exceeded. Please wait.';
+                        statusElement.className = 'status disconnected';
+                    }
+                } else if (response && response.status === 'success') {
+                    log(`Server response: ${JSON.stringify(response)}`);
+                    pressCount = response.count;
+                    counterElement.textContent = pressCount;
+                }
             });
         });
 
         // Log all events for debugging
         socket.onAny((event, ...args) => {
             log(`Received event: ${event} - ${JSON.stringify(args)}`);
+        });
+
+        // Handle rate limit errors
+        socket.on('error', (error) => {
+            log(`Error: ${error.message}`, true);
+            if (error.message.includes('Rate limit exceeded')) {
+                statusElement.textContent = 'Rate limit exceeded. Please wait.';
+                statusElement.className = 'status disconnected';
+            }
         });
     </script>
 </body>

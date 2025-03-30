@@ -48,3 +48,15 @@ class Config:
     REDIS_ENCRYPTION_ITERATIONS = int(os.getenv("REDIS_ENCRYPTION_ITERATIONS", "100000"))
     REDIS_MAX_CACHE_SIZE = int(os.getenv("REDIS_MAX_CACHE_SIZE", "1048576"))  # 1MB in bytes
     REDIS_CACHE_TTL = int(os.getenv("REDIS_CACHE_TTL", "300"))  # 5 minutes in seconds
+
+    # WebSocket Configuration
+    WS_ALLOWED_ORIGINS = os.getenv("WS_ALLOWED_ORIGINS", "http://localhost:5000,https://localhost:5000").split(",")
+    WS_RATE_LIMIT_CONNECTIONS = int(os.getenv("WS_RATE_LIMIT_CONNECTIONS", "5"))  # Max connections per minute
+    WS_RATE_LIMIT_MESSAGES = int(os.getenv("WS_RATE_LIMIT_MESSAGES", "100"))  # Max messages per minute
+    WS_RATE_LIMIT_WINDOW = int(os.getenv("WS_RATE_LIMIT_WINDOW", "60"))  # Rate limit window in seconds
+    WS_SESSION_TTL = int(os.getenv("WS_SESSION_TTL", "3600"))  # Session TTL in seconds (1 hour)
+    WS_ENABLE_SSL = os.getenv("WS_ENABLE_SSL", "true").lower() == "true"
+    WS_SSL_VERIFY_MODE = os.getenv("WS_SSL_VERIFY_MODE", "required")
+    WS_MAX_PAYLOAD_SIZE = int(os.getenv("WS_MAX_PAYLOAD_SIZE", "1048576"))  # 1MB in bytes
+    WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "60"))  # Ping timeout in seconds
+    WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "25"))  # Ping interval in seconds

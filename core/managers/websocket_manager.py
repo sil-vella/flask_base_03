@@ -1,19 +1,93 @@
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask import request
-from typing import Dict, Any, Set, Callable
+from typing import Dict, Any, Set, Callable, Optional
 from tools.logger.custom_logging import custom_log
+from core.managers.redis_manager import RedisManager
+from utils.config.config import Config
+import time
+from datetime import datetime
 
 class WebSocketManager:
     def __init__(self):
+        self.redis_manager = RedisManager()
         self.socketio = SocketIO(
-            cors_allowed_origins="*",
+            cors_allowed_origins="*",  # Will be overridden by module
             async_mode='gevent',
             logger=True,
-            engineio_logger=True
+            engineio_logger=True,
+            max_http_buffer_size=Config.WS_MAX_PAYLOAD_SIZE,
+            ping_timeout=Config.WS_PING_TIMEOUT,
+            ping_interval=Config.WS_PING_INTERVAL
         )
         self.rooms: Dict[str, Set[str]] = {}  # room_id -> set of session_ids
         self.session_rooms: Dict[str, Set[str]] = {}  # session_id -> set of room_ids
+        self._rate_limits = {
+            'connections': {
+                'max': Config.WS_RATE_LIMIT_CONNECTIONS,
+                'window': Config.WS_RATE_LIMIT_WINDOW
+            },
+            'messages': {
+                'max': Config.WS_RATE_LIMIT_MESSAGES,
+                'window': Config.WS_RATE_LIMIT_WINDOW
+            }
+        }
         custom_log("WebSocketManager initialized")
+
+    def set_cors_origins(self, origins: list):
+        """Set allowed CORS origins."""
+        self.socketio.cors_allowed_origins = origins
+        custom_log(f"Updated CORS origins: {origins}")
+
+    def validate_origin(self, origin: str) -> bool:
+        """Validate if the origin is allowed."""
+        return origin in self.socketio.cors_allowed_origins or origin == "app://mobile"
+
+    def check_rate_limit(self, client_id: str, limit_type: str) -> bool:
+        """Check if client has exceeded rate limits."""
+        if limit_type not in self._rate_limits:
+            return True  # Unknown limit type, allow by default
+            
+        limit = self._rate_limits[limit_type]
+        key = f"ws:{limit_type}:{client_id}"
+        count = self.redis_manager.get(key) or 0
+        
+        if count >= limit['max']:
+            custom_log(f"Rate limit exceeded for {limit_type}: {client_id}")
+            return False
+            
+        return True
+
+    def update_rate_limit(self, client_id: str, limit_type: str):
+        """Update rate limit counter."""
+        if limit_type not in self._rate_limits:
+            return
+            
+        limit = self._rate_limits[limit_type]
+        key = f"ws:{limit_type}:{client_id}"
+        self.redis_manager.incr(key)
+        self.redis_manager.expire(key, limit['window'])
+
+    def store_session_data(self, session_id: str, client_id: str, origin: str):
+        """Store session information in Redis."""
+        session_data = {
+            'client_id': client_id,
+            'origin': origin,
+            'connected_at': datetime.utcnow().isoformat(),
+            'last_active': datetime.utcnow().isoformat()
+        }
+        self.redis_manager.set(f"ws:session:{session_id}", session_data, expire=Config.WS_SESSION_TTL)
+
+    def cleanup_session_data(self, session_id: str):
+        """Clean up session data from Redis."""
+        self.redis_manager.delete(f"ws:session:{session_id}")
+
+    def update_session_activity(self, session_id: str):
+        """Update last active timestamp for session."""
+        session_key = f"ws:session:{session_id}"
+        session_data = self.redis_manager.get(session_key)
+        if session_data:
+            session_data['last_active'] = datetime.utcnow().isoformat()
+            self.redis_manager.set(session_key, session_data)
 
     def initialize(self, app):
         """Initialize WebSocket support with the Flask app."""
