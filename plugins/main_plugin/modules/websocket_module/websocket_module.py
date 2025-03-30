@@ -16,6 +16,10 @@ class WebSocketModule:
         self.websocket_manager = WebSocketManager()
         self.redis_manager = RedisManager()
         self.jwt_manager = JWTManager()  # Initialize JWT manager
+        
+        # Set JWT manager in WebSocket manager
+        self.websocket_manager.set_jwt_manager(self.jwt_manager)
+        
         if app_manager and app_manager.flask_app:
             self.websocket_manager.initialize(app_manager.flask_app)
         
@@ -37,12 +41,16 @@ class WebSocketModule:
 
     def _register_handlers(self):
         """Register all WebSocket event handlers."""
+        # Connect and disconnect don't use authentication
         self.websocket_manager.register_handler('connect', self._handle_connect)
         self.websocket_manager.register_handler('disconnect', self._handle_disconnect)
-        self.websocket_manager.register_handler('join', self._handle_join)
-        self.websocket_manager.register_handler('leave', self._handle_leave)
-        self.websocket_manager.register_handler('message', self._handle_message)
-        self.websocket_manager.register_handler('button_press', self._handle_button_press)
+        
+        # All other handlers use authentication
+        self.websocket_manager.register_authenticated_handler('join', self._handle_join)
+        self.websocket_manager.register_authenticated_handler('leave', self._handle_leave)
+        self.websocket_manager.register_authenticated_handler('message', self._handle_message)
+        self.websocket_manager.register_authenticated_handler('button_press', self._handle_button_press)
+        self.websocket_manager.register_authenticated_handler('get_counter', self._handle_get_counter)
         custom_log("WebSocket event handlers registered")
 
     def _validate_token(self, token: str) -> Optional[Dict[str, Any]]:
@@ -124,37 +132,27 @@ class WebSocketModule:
         self.websocket_manager.cleanup_session(session_id)
         custom_log(f"WebSocket disconnected: {session_id}")
 
-    def _handle_join(self, data: Dict[str, Any]):
+    def _handle_join(self, data: Dict[str, Any], session_data: Dict[str, Any]):
         """Handle joining a room with authentication."""
         session_id = request.sid
         room_id = data.get('room_id')
         if not room_id:
             raise ValueError("room_id is required")
-            
-        # Get session data and validate user
-        session_data = self.websocket_manager.get_session_data(session_id)
-        if not session_data or 'user_id' not in session_data:
-            return {'status': 'error', 'message': 'Authentication required'}
         
         self.websocket_manager.join_room(room_id, session_id)
         return {'status': 'joined', 'room_id': room_id}
 
-    def _handle_leave(self, data: Dict[str, Any]):
+    def _handle_leave(self, data: Dict[str, Any], session_data: Dict[str, Any]):
         """Handle leaving a room with authentication."""
         session_id = request.sid
         room_id = data.get('room_id')
         if not room_id:
             raise ValueError("room_id is required")
-            
-        # Get session data and validate user
-        session_data = self.websocket_manager.get_session_data(session_id)
-        if not session_data or 'user_id' not in session_data:
-            return {'status': 'error', 'message': 'Authentication required'}
         
         self.websocket_manager.leave_room(room_id, session_id)
         return {'status': 'left', 'room_id': room_id}
 
-    def _handle_message(self, data: Dict[str, Any]):
+    def _handle_message(self, data: Dict[str, Any], session_data: Dict[str, Any]):
         """Handle incoming messages with authentication."""
         session_id = request.sid
         message = data.get('message')
@@ -163,20 +161,12 @@ class WebSocketModule:
         if not message:
             raise ValueError("message is required")
             
-        # Get session data and validate user
-        session_data = self.websocket_manager.get_session_data(session_id)
-        if not session_data or 'user_id' not in session_data:
-            return {'status': 'error', 'message': 'Authentication required'}
-            
         # Check rate limits for messages
         if not self.websocket_manager.check_rate_limit(session_data['client_id'], 'messages'):
             return {'status': 'error', 'message': 'Rate limit exceeded'}
             
         # Update rate limits
         self.websocket_manager.update_rate_limit(session_data['client_id'], 'messages')
-        
-        # Update session activity
-        self.websocket_manager.update_session_activity(session_id)
         
         # Broadcast message to room or all connected clients
         if room_id:
@@ -194,15 +184,10 @@ class WebSocketModule:
             
         return {'status': 'sent'}
 
-    def _handle_button_press(self, data: Dict[str, Any] = None):
-        """Handle button press events with authentication."""
+    def _handle_button_press(self, data: Dict[str, Any]):
+        """Handle button press events."""
         session_id = request.sid
         
-        # Get session data and validate user
-        session_data = self.websocket_manager.get_session_data(session_id)
-        if not session_data or 'user_id' not in session_data:
-            return {'status': 'error', 'message': 'Authentication required'}
-            
         # Update counter in Redis
         counter_key = f"button_counter:{self.button_counter_room}"
         current_count = self.redis_manager.incr(counter_key)
@@ -214,6 +199,12 @@ class WebSocketModule:
             {'count': current_count}
         )
         
+        return {'status': 'success', 'count': current_count}
+
+    def _handle_get_counter(self, data: Dict[str, Any]):
+        """Handle getting the current counter value."""
+        counter_key = f"button_counter:{self.button_counter_room}"
+        current_count = self.redis_manager.get(counter_key) or 0
         return {'status': 'success', 'count': current_count}
 
     def broadcast_to_room(self, room_id: str, event: str, data: Any):

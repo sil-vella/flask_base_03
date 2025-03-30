@@ -120,7 +120,7 @@
 
         <!-- Counter Section -->
         <div id="counterSection" style="display: none;">
-            <div class="counter" id="counter">0</div>
+            <div class="counter" id="counter">Loading...</div>
             <button id="pressButton">Press Me!</button>
         </div>
 
@@ -132,6 +132,10 @@
         let socket = null;
         let accessToken = null;
         let refreshToken = null;
+        let isConnected = false;
+        let retryCount = 0;
+        const maxRetries = 5;
+        const retryDelay = 2000; // 2 seconds
 
         function log(message, isError = false) {
             const debug = document.getElementById('debug');
@@ -139,6 +143,14 @@
             const logClass = isError ? 'error' : '';
             debug.innerHTML += `<span class="${logClass}">[${time}] ${message}</span><br>`;
             debug.scrollTop = debug.scrollHeight;
+        }
+
+        function updateCounterDisplay(count) {
+            const counterElement = document.getElementById('counter');
+            if (counterElement) {
+                counterElement.textContent = count;
+                log('Counter display updated: ' + count);
+            }
         }
 
         async function login() {
@@ -255,21 +267,60 @@
                 log('Connected to WebSocket server');
                 document.getElementById('status').textContent = 'Connected';
                 document.getElementById('status').className = 'status connected';
+                isConnected = true;
+                retryCount = 0;
+
+                // Request initial counter value
+                socket.emit('get_counter', {}, (response) => {
+                    if (response && response.status === 'success') {
+                        updateCounterDisplay(response.count);
+                        log('Initial counter value: ' + response.count);
+                    } else {
+                        updateCounterDisplay(0);
+                        log('Failed to get initial counter value', true);
+                    }
+                });
             });
 
             socket.on('disconnect', () => {
                 log('Disconnected from WebSocket server');
                 document.getElementById('status').textContent = 'Disconnected';
                 document.getElementById('status').className = 'status disconnected';
+                isConnected = false;
+                
+                // Only retry if we still have a token
+                if (accessToken && retryCount < maxRetries) {
+                    retryCount++;
+                    log(`Retrying connection (${retryCount}/${maxRetries})...`);
+                    setTimeout(connectWebSocket, retryDelay);
+                } else {
+                    log('Connection failed. Please log in again.', true);
+                    // Reset UI to login state
+                    document.getElementById('loginForm').style.display = 'block';
+                    document.getElementById('userInfo').style.display = 'none';
+                    document.getElementById('counterSection').style.display = 'none';
+                    document.getElementById('counter').textContent = '0';
+                }
             });
 
             socket.on('connect_error', (error) => {
                 log('Connection error: ' + error.message, true);
+                if (error.message.includes('Authentication required')) {
+                    log('Authentication error: Please log in again', true);
+                    // Reset UI to login state
+                    document.getElementById('loginForm').style.display = 'block';
+                    document.getElementById('userInfo').style.display = 'none';
+                    document.getElementById('counterSection').style.display = 'none';
+                    document.getElementById('counter').textContent = '0';
+                }
             });
 
+            // Handle counter updates
             socket.on('counter_update', (data) => {
-                document.getElementById('counter').textContent = data.count;
-                log('Counter updated: ' + data.count);
+                if (data && typeof data.count !== 'undefined') {
+                    updateCounterDisplay(data.count);
+                    log('Counter updated: ' + data.count);
+                }
             });
 
             socket.on('error', (error) => {
@@ -277,20 +328,24 @@
             });
         }
 
-        // Button press handler
+        // Button press handler - simplified to only handle counter
         document.getElementById('pressButton').addEventListener('click', () => {
-            if (socket && socket.connected) {
+            if (socket && isConnected) {
                 socket.emit('button_press', {}, (response) => {
-                    if (response && response.status === 'error') {
-                        log('Error: ' + response.message, true);
-                    } else if (response && response.status === 'success') {
+                    if (response && response.status === 'success') {
+                        updateCounterDisplay(response.count);
                         log('Button pressed successfully. Count: ' + response.count);
+                    } else if (response && response.status === 'error') {
+                        log('Error: ' + response.message, true);
                     }
                 });
             } else {
                 log('Not connected to server', true);
             }
         });
+
+        // Initial connection
+        connectWebSocket();
     </script>
 </body>
 </html> 
