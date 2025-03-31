@@ -68,17 +68,21 @@ class Config:
     REDIS_CACHE_TTL = int(os.getenv("REDIS_CACHE_TTL", "300"))  # 5 minutes in seconds
 
     # WebSocket Configuration
-    WS_ALLOWED_ORIGINS = os.getenv("WS_ALLOWED_ORIGINS", "http://localhost:5000,https://localhost:5000").split(",")
-    WS_RATE_LIMIT_CONNECTIONS = int(os.getenv("WS_RATE_LIMIT_CONNECTIONS", "5"))  # Max connections per minute
-    WS_RATE_LIMIT_MESSAGES = int(os.getenv("WS_RATE_LIMIT_MESSAGES", "100"))  # Max messages per minute
-    WS_RATE_LIMIT_WINDOW = int(os.getenv("WS_RATE_LIMIT_WINDOW", "60"))  # Rate limit window in seconds
-    WS_SESSION_TTL = int(os.getenv("WS_SESSION_TTL", "3600"))  # Session TTL in seconds (1 hour)
-    WS_ENABLE_SSL = os.getenv("WS_ENABLE_SSL", "true").lower() == "true"
-    WS_SSL_VERIFY_MODE = os.getenv("WS_SSL_VERIFY_MODE", "required")
-    WS_MAX_PAYLOAD_SIZE = int(os.getenv("WS_MAX_PAYLOAD_SIZE", "1048576"))  # 1MB in bytes
-    WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "60"))  # Ping timeout in seconds
-    WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "25"))  # Ping interval in seconds
-    
-    # Room Size Limits
-    WS_ROOM_SIZE_LIMIT = int(os.getenv("WS_ROOM_SIZE_LIMIT", "2"))  # Maximum users per room
-    WS_ROOM_SIZE_CHECK_INTERVAL = int(os.getenv("WS_ROOM_SIZE_CHECK_INTERVAL", "60"))  # Check interval in seconds
+    WS_MAX_PAYLOAD_SIZE = 1024 * 1024  # 1MB max payload size
+    WS_PING_TIMEOUT = 60
+    WS_PING_INTERVAL = 25
+    WS_RATE_LIMIT_CONNECTIONS = 100
+    WS_RATE_LIMIT_MESSAGES = 1000
+    WS_RATE_LIMIT_WINDOW = 3600  # 1 hour
+    WS_SESSION_TTL = 3600  # 1 hour
+    WS_ROOM_SIZE_LIMIT = 2
+    WS_ROOM_SIZE_CHECK_INTERVAL = 300  # 5 minutes
+    WS_ALLOWED_ORIGINS = ['http://localhost:5000', 'http://localhost:3000']
+
+    # Message Size Limits
+    WS_MAX_MESSAGE_LENGTH = 1000  # Maximum length for text messages
+    WS_MAX_BINARY_SIZE = 5 * 1024 * 1024  # 5MB for binary data
+    WS_MAX_JSON_DEPTH = 10  # Maximum nesting depth for JSON messages
+    WS_MAX_JSON_SIZE = 1024 * 1024  # 1MB for JSON messages
+    WS_MAX_ARRAY_SIZE = 1000  # Maximum number of elements in arrays
+    WS_MAX_OBJECT_SIZE = 100  # Maximum number of properties in objects

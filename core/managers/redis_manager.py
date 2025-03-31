@@ -297,4 +297,39 @@ class RedisManager:
                 self.connection_pool.disconnect()
                 custom_log("✅ Redis connection pool disposed")
         except Exception as e:
-            custom_log(f"❌ Error disposing Redis connection pool: {e}") 
+            custom_log(f"❌ Error disposing Redis connection pool: {e}")
+
+    def get_room_size(self, room_id: str) -> int:
+        """Get room size from Redis without encryption."""
+        try:
+            key = f"ws:room:{room_id}:size"
+            value = self.redis.get(key)
+            return int(value) if value is not None else 0
+        except Exception as e:
+            custom_log(f"❌ Error getting room size from Redis: {e}")
+            return 0
+
+    def update_room_size(self, room_id: str, delta: int) -> bool:
+        """Update room size in Redis without encryption."""
+        try:
+            key = f"ws:room:{room_id}:size"
+            if delta > 0:
+                self.redis.incr(key)
+            else:
+                self.redis.decr(key)
+            # Set expiration to prevent stale data
+            self.redis.expire(key, Config.WS_ROOM_SIZE_CHECK_INTERVAL)
+            return True
+        except Exception as e:
+            custom_log(f"❌ Error updating room size in Redis: {e}")
+            return False
+
+    def reset_room_size(self, room_id: str) -> bool:
+        """Reset room size in Redis without encryption."""
+        try:
+            key = f"ws:room:{room_id}:size"
+            self.redis.delete(key)
+            return True
+        except Exception as e:
+            custom_log(f"❌ Error resetting room size in Redis: {e}")
+            return False 

@@ -2,6 +2,8 @@ from typing import Dict, Any, Optional, Set
 from tools.logger.custom_logging import custom_log
 import re
 from datetime import datetime
+import json
+from utils.config.config import Config
 
 class WebSocketValidator:
     """Validates WebSocket inputs and sanitizes data."""
@@ -24,13 +26,98 @@ class WebSocketValidator:
             return "Message content is required"
             
         if not isinstance(message, str):
-            return "Message must be a string"
+            return "Message content must be a string"
             
-        if len(message) > WebSocketValidator.MAX_MESSAGE_LENGTH:
-            return f"Message too long (max {WebSocketValidator.MAX_MESSAGE_LENGTH} characters)"
+        # Check message length
+        if len(message) > Config.WS_MAX_MESSAGE_LENGTH:
+            return f"Message exceeds maximum length of {Config.WS_MAX_MESSAGE_LENGTH} characters"
+            
+        # Sanitize message content
+        data['message'] = WebSocketValidator.sanitize_message(message)
+        return None
+
+    @staticmethod
+    def validate_binary_data(data: bytes) -> Optional[str]:
+        """Validate binary data size."""
+        if not isinstance(data, bytes):
+            return "Data must be binary"
+            
+        if len(data) > Config.WS_MAX_BINARY_SIZE:
+            return f"Binary data exceeds maximum size of {Config.WS_MAX_BINARY_SIZE} bytes"
             
         return None
-        
+
+    @staticmethod
+    def validate_json_data(data: Dict[str, Any]) -> Optional[str]:
+        """Validate JSON data structure and size."""
+        if not isinstance(data, dict):
+            return "Data must be a JSON object"
+            
+        # Check JSON size
+        json_str = json.dumps(data)
+        if len(json_str) > Config.WS_MAX_JSON_SIZE:
+            return f"JSON data exceeds maximum size of {Config.WS_MAX_JSON_SIZE} bytes"
+            
+        # Check nesting depth
+        depth = WebSocketValidator._get_json_depth(data)
+        if depth > Config.WS_MAX_JSON_DEPTH:
+            return f"JSON data exceeds maximum nesting depth of {Config.WS_MAX_JSON_DEPTH}"
+            
+        # Check array size
+        if WebSocketValidator._get_max_array_size(data) > Config.WS_MAX_ARRAY_SIZE:
+            return f"JSON array exceeds maximum size of {Config.WS_MAX_ARRAY_SIZE} elements"
+            
+        # Check object size
+        if WebSocketValidator._get_max_object_size(data) > Config.WS_MAX_OBJECT_SIZE:
+            return f"JSON object exceeds maximum size of {Config.WS_MAX_OBJECT_SIZE} properties"
+            
+        return None
+
+    @staticmethod
+    def _get_json_depth(obj: Any, current_depth: int = 0) -> int:
+        """Calculate the maximum nesting depth of a JSON structure."""
+        if not isinstance(obj, (dict, list)):
+            return current_depth
+            
+        max_depth = current_depth + 1
+        if isinstance(obj, dict):
+            for value in obj.values():
+                max_depth = max(max_depth, WebSocketValidator._get_json_depth(value, current_depth + 1))
+        else:  # list
+            for item in obj:
+                max_depth = max(max_depth, WebSocketValidator._get_json_depth(item, current_depth + 1))
+        return max_depth
+
+    @staticmethod
+    def _get_max_array_size(obj: Any) -> int:
+        """Calculate the maximum size of any array in the JSON structure."""
+        if not isinstance(obj, (dict, list)):
+            return 0
+            
+        max_size = len(obj) if isinstance(obj, list) else 0
+        if isinstance(obj, dict):
+            for value in obj.values():
+                max_size = max(max_size, WebSocketValidator._get_max_array_size(value))
+        else:  # list
+            for item in obj:
+                max_size = max(max_size, WebSocketValidator._get_max_array_size(item))
+        return max_size
+
+    @staticmethod
+    def _get_max_object_size(obj: Any) -> int:
+        """Calculate the maximum number of properties in any object in the JSON structure."""
+        if not isinstance(obj, (dict, list)):
+            return 0
+            
+        max_size = len(obj) if isinstance(obj, dict) else 0
+        if isinstance(obj, dict):
+            for value in obj.values():
+                max_size = max(max_size, WebSocketValidator._get_max_object_size(value))
+        else:  # list
+            for item in obj:
+                max_size = max(max_size, WebSocketValidator._get_max_object_size(item))
+        return max_size
+
     @staticmethod
     def validate_room_id(room_id: str) -> Optional[str]:
         """Validate room ID."""

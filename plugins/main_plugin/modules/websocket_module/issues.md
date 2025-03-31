@@ -100,10 +100,22 @@
 - **Testing**: Verify log completeness
 
 ### 10. Message Size Limits ✅
-- **Status**: Partially Implemented
+- **Status**: Implemented
 - **Implementation**:
-  - Basic buffer size limit via `max_http_buffer_size`
-- **Recommendation**: Add more granular message size validation
+  - Added granular message size limits in Config:
+    - `WS_MAX_MESSAGE_LENGTH`: 1000 characters for text messages
+    - `WS_MAX_BINARY_SIZE`: 5MB for binary data
+    - `WS_MAX_JSON_DEPTH`: 10 levels for JSON nesting
+    - `WS_MAX_JSON_SIZE`: 1MB for JSON messages
+    - `WS_MAX_ARRAY_SIZE`: 1000 elements for arrays
+    - `WS_MAX_OBJECT_SIZE`: 100 properties for objects
+  - Enhanced WebSocketValidator with new validation methods:
+    - `validate_message()`: Text message validation
+    - `validate_binary_data()`: Binary data validation
+    - `validate_json_data()`: JSON structure validation
+  - Added validation in WebSocketManager event handlers
+  - Added proper error handling and logging
+- **Testing**: Verify size limits with various message types
 
 ## Implementation Notes
 

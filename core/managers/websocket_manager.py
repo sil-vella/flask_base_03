@@ -144,6 +144,10 @@ class WebSocketManager:
         @self.socketio.on(event)
         def wrapped_handler(data=None):
             try:
+                # Skip validation for special events
+                if event in ['connect', 'disconnect']:
+                    return handler(data)
+                    
                 # Ensure data is a dictionary if None is provided
                 if data is None:
                     data = {}
@@ -152,6 +156,18 @@ class WebSocketManager:
                 error = self.validator.validate_event_payload(event, data)
                 if error:
                     custom_log(f"Validation error in {event} handler: {error}")
+                    return {'status': 'error', 'message': error}
+                    
+                # Validate message size based on event type
+                if event == 'message':
+                    error = self.validator.validate_message(data)
+                elif event == 'binary':
+                    error = self.validator.validate_binary_data(data)
+                else:
+                    error = self.validator.validate_json_data(data)
+                    
+                if error:
+                    custom_log(f"Message size validation error in {event} handler: {error}")
                     return {'status': 'error', 'message': error}
                     
                 return handler(data)
@@ -164,6 +180,10 @@ class WebSocketManager:
         @self.socketio.on(event)
         def wrapped_handler(data=None):
             try:
+                # Skip validation for special events
+                if event in ['connect', 'disconnect']:
+                    return handler(data)
+                    
                 # Ensure data is a dictionary if None is provided
                 if data is None:
                     data = {}
@@ -172,6 +192,18 @@ class WebSocketManager:
                 error = self.validator.validate_event_payload(event, data)
                 if error:
                     custom_log(f"Validation error in {event} handler: {error}")
+                    return {'status': 'error', 'message': error}
+                    
+                # Validate message size based on event type
+                if event == 'message':
+                    error = self.validator.validate_message(data)
+                elif event == 'binary':
+                    error = self.validator.validate_binary_data(data)
+                else:
+                    error = self.validator.validate_json_data(data)
+                    
+                if error:
+                    custom_log(f"Message size validation error in {event} handler: {error}")
                     return {'status': 'error', 'message': error}
                     
                 return handler(data)
@@ -195,21 +227,11 @@ class WebSocketManager:
 
     def get_room_size(self, room_id: str) -> int:
         """Get the current number of users in a room."""
-        # Try to get from Redis first
-        redis_key = f"ws:room:{room_id}:size"
-        size = self.redis_manager.get(redis_key)
-        if size is not None:
-            return int(size)
-            
-        # If not in Redis, count from memory
-        return len(self.rooms.get(room_id, set()))
+        return self.redis_manager.get_room_size(room_id)
 
     def update_room_size(self, room_id: str, delta: int):
         """Update the room size in Redis."""
-        redis_key = f"ws:room:{room_id}:size"
-        current_size = self.get_room_size(room_id)
-        new_size = max(0, current_size + delta)
-        self.redis_manager.set(redis_key, str(new_size), expire=self._room_size_check_interval)
+        self.redis_manager.update_room_size(room_id, delta)
 
     def check_room_size_limit(self, room_id: str) -> bool:
         """Check if a room has reached its size limit."""
