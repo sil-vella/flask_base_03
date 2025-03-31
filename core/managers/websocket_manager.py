@@ -3,13 +3,16 @@ from flask import request
 from typing import Dict, Any, Set, Callable, Optional
 from tools.logger.custom_logging import custom_log
 from core.managers.redis_manager import RedisManager
+from core.validators.websocket_validators import WebSocketValidator
 from utils.config.config import Config
 import time
 from datetime import datetime
+from functools import wraps
 
 class WebSocketManager:
     def __init__(self):
         self.redis_manager = RedisManager()
+        self.validator = WebSocketValidator()
         self.socketio = SocketIO(
             cors_allowed_origins="*",  # Will be overridden by module
             async_mode='gevent',
@@ -31,6 +34,8 @@ class WebSocketManager:
                 'window': Config.WS_RATE_LIMIT_WINDOW
             }
         }
+        self._jwt_manager = None  # Will be set by the module
+        self._room_access_check = None  # Will be set by the module
         custom_log("WebSocketManager initialized")
 
     def set_cors_origins(self, origins: list):
@@ -92,14 +97,81 @@ class WebSocketManager:
         self.socketio.init_app(app)
         custom_log("WebSocket support initialized with Flask app")
 
+    def set_jwt_manager(self, jwt_manager):
+        """Set the JWT manager instance."""
+        self._jwt_manager = jwt_manager
+        custom_log("JWT manager set in WebSocketManager")
+
+    def set_room_access_check(self, access_check_func):
+        """Set the room access check function."""
+        self._room_access_check = access_check_func
+        custom_log("Room access check function set")
+
+    def check_room_access(self, room_id: str, user_id: str, user_roles: Set[str]) -> bool:
+        """Check if a user has access to a room using the module's access check function."""
+        if not self._room_access_check:
+            custom_log("No room access check function set")
+            return False
+        return self._room_access_check(room_id, user_id, user_roles)
+
+    def requires_auth(self, handler: Callable) -> Callable:
+        """Decorator to require authentication for WebSocket handlers."""
+        @wraps(handler)
+        def wrapper(data=None):
+            try:
+                session_id = request.sid
+                
+                # Get session data
+                session_data = self.get_session_data(session_id)
+                if not session_data or 'user_id' not in session_data:
+                    custom_log(f"Session {session_id} not authenticated")
+                    return {'status': 'error', 'message': 'Authentication required'}
+                
+                # Update session activity
+                self.update_session_activity(session_id)
+                
+                # Call the handler with session data
+                return handler(data, session_data)
+            except Exception as e:
+                custom_log(f"Error in authenticated handler: {str(e)}")
+                return {'status': 'error', 'message': str(e)}
+        return wrapper
+
     def register_handler(self, event: str, handler: Callable):
-        """Register a WebSocket event handler."""
+        """Register a WebSocket event handler without authentication."""
         @self.socketio.on(event)
         def wrapped_handler(data=None):
             try:
                 # Ensure data is a dictionary if None is provided
                 if data is None:
                     data = {}
+                    
+                # Validate event payload
+                error = self.validator.validate_event_payload(event, data)
+                if error:
+                    custom_log(f"Validation error in {event} handler: {error}")
+                    return {'status': 'error', 'message': error}
+                    
+                return handler(data)
+            except Exception as e:
+                custom_log(f"Error in {event} handler: {str(e)}")
+                return {'status': 'error', 'message': str(e)}
+
+    def register_authenticated_handler(self, event: str, handler: Callable):
+        """Register a WebSocket event handler with authentication."""
+        @self.socketio.on(event)
+        def wrapped_handler(data=None):
+            try:
+                # Ensure data is a dictionary if None is provided
+                if data is None:
+                    data = {}
+                    
+                # Validate event payload
+                error = self.validator.validate_event_payload(event, data)
+                if error:
+                    custom_log(f"Validation error in {event} handler: {error}")
+                    return {'status': 'error', 'message': error}
+                    
                 return handler(data)
             except Exception as e:
                 custom_log(f"Error in {event} handler: {str(e)}")
@@ -107,12 +179,31 @@ class WebSocketManager:
 
     def create_room(self, room_id: str):
         """Create a new room if it doesn't exist."""
+        # Validate room ID
+        error = self.validator.validate_room_id(room_id)
+        if error:
+            custom_log(f"Invalid room ID: {error}")
+            return False
+            
         if room_id not in self.rooms:
             self.rooms[room_id] = set()
             custom_log(f"Created new room: {room_id}")
+            return True
+        return False
 
-    def join_room(self, room_id: str, session_id: str):
-        """Join a room with session tracking."""
+    def join_room(self, room_id: str, session_id: str, user_id: str = None, user_roles: Set[str] = None):
+        """Join a room with access control."""
+        # Validate room ID
+        error = self.validator.validate_room_id(room_id)
+        if error:
+            custom_log(f"Invalid room ID: {error}")
+            return False
+
+        # If user_id and roles are provided, check access
+        if user_id and user_roles and not self.check_room_access(room_id, user_id, user_roles):
+            custom_log(f"Access denied for user {user_id} to room {room_id}")
+            return False
+
         self.create_room(room_id)
         join_room(room_id)
         
@@ -123,9 +214,10 @@ class WebSocketManager:
         self.session_rooms[session_id].add(room_id)
         
         custom_log(f"Session {session_id} joined room {room_id}")
+        return True
 
     def leave_room(self, room_id: str, session_id: str):
-        """Leave a room with session tracking."""
+        """Leave a room with cleanup."""
         leave_room(room_id)
         
         # Update room membership
@@ -136,13 +228,33 @@ class WebSocketManager:
             
         custom_log(f"Session {session_id} left room {room_id}")
 
-    def broadcast_to_room(self, room_id: str, event: str, data: Any):
-        """Broadcast message to all clients in a room."""
+    def broadcast_to_room(self, room_id: str, event: str, data: Dict[str, Any]):
+        """Broadcast an event to all users in a room."""
+        # Validate room ID
+        error = self.validator.validate_room_id(room_id)
+        if error:
+            custom_log(f"Invalid room ID: {error}")
+            return False
+            
+        # Validate event payload
+        error = self.validator.validate_event_payload(event, data)
+        if error:
+            custom_log(f"Validation error in broadcast: {error}")
+            return False
+            
         emit(event, data, room=room_id)
+        return True
 
-    def broadcast_to_all(self, event: str, data: Any):
-        """Broadcast message to all connected clients."""
-        emit(event, data, broadcast=True)
+    def broadcast_to_all(self, event: str, data: Dict[str, Any]):
+        """Broadcast an event to all connected clients."""
+        # Validate event payload
+        error = self.validator.validate_event_payload(event, data)
+        if error:
+            custom_log(f"Validation error in broadcast: {error}")
+            return False
+            
+        emit(event, data)
+        return True
 
     def send_to_session(self, session_id: str, event: str, data: Any):
         """Send message to a specific client."""

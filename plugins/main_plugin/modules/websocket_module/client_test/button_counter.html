@@ -98,6 +98,45 @@
             background-color: #E3F2FD;
             border-radius: 5px;
         }
+        .counter-container {
+            margin-bottom: 20px;
+        }
+        .connected-users {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-radius: 5px;
+            text-align: left;
+        }
+        .connected-users h3 {
+            margin: 0 0 10px 0;
+            color: #333;
+        }
+        #userList {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        #userList li {
+            padding: 5px 0;
+            border-bottom: 1px solid #eee;
+        }
+        #userList li:last-child {
+            border-bottom: none;
+        }
+        .user-status {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .user-status.online {
+            background-color: #4CAF50;
+        }
+        .user-status.offline {
+            background-color: #f44336;
+        }
     </style>
 </head>
 <body>
@@ -120,8 +159,15 @@
 
         <!-- Counter Section -->
         <div id="counterSection" style="display: none;">
-            <div class="counter" id="counter">Loading...</div>
-            <button id="pressButton">Press Me!</button>
+            <div class="counter-container">
+                <div class="counter" id="counter">0</div>
+                <button id="pressButton">Press Me!</button>
+                <button id="testInvalidData" style="background-color: #f44336;">Test Invalid Data</button>
+            </div>
+            <div class="connected-users">
+                <h3>Connected Users</h3>
+                <ul id="userList"></ul>
+            </div>
         </div>
 
         <div class="status" id="status">Not connected</div>
@@ -136,6 +182,7 @@
         let retryCount = 0;
         const maxRetries = 5;
         const retryDelay = 2000; // 2 seconds
+        let connectedUsers = new Set();
 
         function log(message, isError = false) {
             const debug = document.getElementById('debug');
@@ -149,8 +196,24 @@
             const counterElement = document.getElementById('counter');
             if (counterElement) {
                 counterElement.textContent = count;
-                log('Counter display updated: ' + count);
+                // Add a visual feedback animation
+                counterElement.style.transform = 'scale(1.1)';
+                setTimeout(() => {
+                    counterElement.style.transform = 'scale(1)';
+                }, 200);
             }
+        }
+
+        function updateUserList(users) {
+            const userList = document.getElementById('userList');
+            if (!userList) return;
+
+            userList.innerHTML = users.map(username => `
+                <li>
+                    <span class="user-status online"></span>
+                    ${username}
+                </li>
+            `).join('');
         }
 
         async function login() {
@@ -172,21 +235,29 @@
                 }
 
                 const data = await response.json();
+                log('Server response: ' + JSON.stringify(data)); // Debug log
                 
                 if (data.error) {
                     throw new Error(data.error);
                 }
 
-                accessToken = data.access_token;
-                refreshToken = data.refresh_token;
-                document.getElementById('username').textContent = data.user.username;
-                
-                // Show user info and counter section
+                // Check for tokens in the nested structure
+                if (!data.tokens?.access_token || !data.tokens?.refresh_token) {
+                    log('Server response missing tokens: ' + JSON.stringify(data), true);
+                    throw new Error('Server response missing authentication tokens');
+                }
+
+                // Store tokens from the nested structure
+                accessToken = data.tokens.access_token;
+                refreshToken = data.tokens.refresh_token;
+
+                // Update UI
+                document.getElementById('username').textContent = data.user?.username || email;
                 document.getElementById('loginForm').style.display = 'none';
                 document.getElementById('userInfo').style.display = 'block';
                 document.getElementById('counterSection').style.display = 'block';
                 
-                // Connect to WebSocket
+                // Connect to WebSocket only after successful login and token validation
                 connectWebSocket();
                 
                 log('Login successful');
@@ -195,6 +266,11 @@
                 if (error.message.includes('Failed to fetch')) {
                     log('Make sure the server is running at http://localhost:5000', true);
                 }
+                // Reset UI on login failure
+                document.getElementById('loginForm').style.display = 'block';
+                document.getElementById('userInfo').style.display = 'none';
+                document.getElementById('counterSection').style.display = 'none';
+                document.getElementById('counter').textContent = '0';
             }
         }
 
@@ -246,6 +322,7 @@
         }
 
         function connectWebSocket() {
+            // Validate token before attempting connection
             if (!accessToken) {
                 log('No access token available', true);
                 return;
@@ -256,19 +333,28 @@
                 socket.disconnect();
             }
 
-            // Connect with JWT token
+            log('Attempting to connect to WebSocket server...');
+
+            // Connect with token and room ID
             socket = io('http://localhost:5000', {
                 query: {
+                    token: accessToken,
+                    room_id: 'button_counter_room'
+                },
+                reconnection: true,
+                reconnectionAttempts: maxRetries,
+                reconnectionDelay: retryDelay,
+                auth: {
                     token: accessToken
                 }
             });
 
             socket.on('connect', () => {
-                log('Connected to WebSocket server');
-                document.getElementById('status').textContent = 'Connected';
-                document.getElementById('status').className = 'status connected';
                 isConnected = true;
                 retryCount = 0;
+                document.getElementById('status').textContent = 'Connected';
+                document.getElementById('status').className = 'status connected';
+                log('Connected to WebSocket server');
 
                 // Request initial counter value
                 socket.emit('get_counter', {}, (response) => {
@@ -276,18 +362,53 @@
                         updateCounterDisplay(response.count);
                         log('Initial counter value: ' + response.count);
                     } else {
-                        updateCounterDisplay(0);
                         log('Failed to get initial counter value', true);
+                    }
+                });
+
+                // Request initial user list
+                socket.emit('get_users', {}, (response) => {
+                    if (response && response.status === 'success') {
+                        updateUserList(response.users);
+                    } else {
+                        log('Failed to get initial user list', true);
                     }
                 });
             });
 
+            socket.on('connect_error', (error) => {
+                isConnected = false;
+                document.getElementById('status').textContent = 'Connection Error';
+                document.getElementById('status').className = 'status disconnected';
+                log('Connection error: ' + error.message, true);
+
+                // Handle authentication errors
+                if (error.message.includes('Authentication required') || 
+                    error.message.includes('Invalid authentication')) {
+                    log('Authentication error: Please log in again', true);
+                    // Reset UI to login state
+                    document.getElementById('loginForm').style.display = 'block';
+                    document.getElementById('userInfo').style.display = 'none';
+                    document.getElementById('counterSection').style.display = 'none';
+                    document.getElementById('counter').textContent = '0';
+                    // Clear tokens
+                    accessToken = null;
+                    refreshToken = null;
+                }
+
+                // Handle room access denied
+                if (error.message.includes('Access denied to room')) {
+                    log('Access denied to button counter room', true);
+                    document.getElementById('counterSection').style.display = 'none';
+                }
+            });
+
             socket.on('disconnect', () => {
-                log('Disconnected from WebSocket server');
+                isConnected = false;
                 document.getElementById('status').textContent = 'Disconnected';
                 document.getElementById('status').className = 'status disconnected';
-                isConnected = false;
-                
+                log('Disconnected from WebSocket server');
+
                 // Only retry if we still have a token
                 if (accessToken && retryCount < maxRetries) {
                     retryCount++;
@@ -300,18 +421,9 @@
                     document.getElementById('userInfo').style.display = 'none';
                     document.getElementById('counterSection').style.display = 'none';
                     document.getElementById('counter').textContent = '0';
-                }
-            });
-
-            socket.on('connect_error', (error) => {
-                log('Connection error: ' + error.message, true);
-                if (error.message.includes('Authentication required')) {
-                    log('Authentication error: Please log in again', true);
-                    // Reset UI to login state
-                    document.getElementById('loginForm').style.display = 'block';
-                    document.getElementById('userInfo').style.display = 'none';
-                    document.getElementById('counterSection').style.display = 'none';
-                    document.getElementById('counter').textContent = '0';
+                    // Clear tokens
+                    accessToken = null;
+                    refreshToken = null;
                 }
             });
 
@@ -323,29 +435,84 @@
                 }
             });
 
-            socket.on('error', (error) => {
-                log('WebSocket error: ' + error.message, true);
+            // Handle user list updates
+            socket.on('user_list_update', (data) => {
+                if (data && Array.isArray(data.users)) {
+                    updateUserList(data.users);
+                }
+            });
+
+            // Handle user join/leave events
+            socket.on('user_joined', (data) => {
+                if (data && data.username) {
+                    connectedUsers.add(data.username);
+                    updateUserList(Array.from(connectedUsers));
+                    log(`User joined: ${data.username}`);
+                }
+            });
+
+            socket.on('user_left', (data) => {
+                if (data && data.username) {
+                    connectedUsers.delete(data.username);
+                    updateUserList(Array.from(connectedUsers));
+                    log(`User left: ${data.username}`);
+                }
+            });
+
+            // Handle room access denied
+            socket.on('room_access_denied', (data) => {
+                log('Access denied to room: ' + data.message, true);
+                document.getElementById('counterSection').style.display = 'none';
             });
         }
 
-        // Button press handler - simplified to only handle counter
+        // Update button press handler
         document.getElementById('pressButton').addEventListener('click', () => {
-            if (socket && isConnected) {
-                socket.emit('button_press', {}, (response) => {
-                    if (response && response.status === 'success') {
-                        updateCounterDisplay(response.count);
-                        log('Button pressed successfully. Count: ' + response.count);
-                    } else if (response && response.status === 'error') {
-                        log('Error: ' + response.message, true);
-                    }
-                });
-            } else {
-                log('Not connected to server', true);
+            if (!isConnected) {
+                log('Not connected to WebSocket server', true);
+                return;
             }
+
+            socket.emit('button_press', {}, (response) => {
+                if (response && response.status === 'success') {
+                    log('Button pressed successfully');
+                } else {
+                    log('Error pressing button: ' + (response?.message || 'Unknown error'), true);
+                }
+            });
         });
 
-        // Initial connection
-        connectWebSocket();
+        // Add test invalid data function
+        function testInvalidData() {
+            if (!socket || !isConnected) {
+                log("Not connected to WebSocket server", true);
+                return;
+            }
+
+            // Test 1: Invalid message format (not a dictionary)
+            socket.emit('message', "This is not a dictionary");
+            log("Testing invalid message format (not a dictionary)");
+
+            // Test 2: Message too long
+            const longMessage = "a".repeat(2000); // 2000 characters
+            socket.emit('message', { message: longMessage });
+            log("Testing message too long (2000 characters)");
+
+            // Test 3: Invalid room ID with special characters
+            socket.emit('join', { room_id: "test@room!" });
+            log("Testing invalid room ID with special characters");
+
+            // Test 4: Missing required fields
+            socket.emit('message', {});
+            log("Testing missing required fields");
+
+            // Test 5: Invalid data type
+            socket.emit('message', { message: 123 }); // Message should be string
+            log("Testing invalid data type (number instead of string)");
+        }
+
+        // Add event listener for the test button
+        document.getElementById('testInvalidData').addEventListener('click', testInvalidData);
     </script>
 </body>
 </html> 
