@@ -3,12 +3,19 @@ from core.managers.websocket_manager import WebSocketManager
 from core.managers.redis_manager import RedisManager
 from core.managers.jwt_manager import JWTManager, TokenType
 from tools.logger.custom_logging import custom_log
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Set
 from flask_cors import CORS
 import time
 import os
 from datetime import datetime, timedelta
 from utils.config.config import Config
+from enum import Enum
+
+class RoomPermission(Enum):
+    PUBLIC = "public"  # Anyone can join
+    PRIVATE = "private"  # Only invited users can join
+    RESTRICTED = "restricted"  # Only users with specific roles can join
+    OWNER_ONLY = "owner_only"  # Only room owner can join
 
 class WebSocketModule:
     def __init__(self, app_manager=None):
@@ -20,14 +27,19 @@ class WebSocketModule:
         # Set JWT manager in WebSocket manager
         self.websocket_manager.set_jwt_manager(self.jwt_manager)
         
+        # Define room ID before initialization
+        self.button_counter_room = "button_counter_room"
+        
         if app_manager and app_manager.flask_app:
             self.websocket_manager.initialize(app_manager.flask_app)
         
         # Initialize CORS settings
         self._setup_cors()
         
+        # Initialize room permissions
+        self._initialize_room_permissions()
+        
         self._register_handlers()
-        self.button_counter_room = "button_counter_room"
         custom_log("WebSocketModule initialized")
 
     def _setup_cors(self):
@@ -38,6 +50,44 @@ class WebSocketModule:
         # Configure CORS with specific origins
         self.websocket_manager.set_cors_origins(allowed_origins)
         custom_log(f"WebSocket CORS configured for origins: {allowed_origins}")
+
+    def _initialize_room_permissions(self):
+        """Initialize default room permissions."""
+        # Default room permissions
+        self.room_permissions = {
+            self.button_counter_room: {
+                'permission': RoomPermission.PUBLIC,
+                'owner_id': None,
+                'allowed_users': set(),
+                'allowed_roles': set(),
+                'created_at': datetime.utcnow().isoformat()
+            }
+        }
+        custom_log("Room permissions initialized")
+
+    def _check_room_access(self, room_id: str, user_id: str, user_roles: Set[str]) -> bool:
+        """Check if a user has permission to join a room."""
+        if room_id not in self.room_permissions:
+            custom_log(f"Room {room_id} not found")
+            return False
+            
+        room_data = self.room_permissions[room_id]
+        permission = room_data['permission']
+        
+        # Check permission type
+        if permission == RoomPermission.PUBLIC:
+            return True
+            
+        if permission == RoomPermission.PRIVATE:
+            return user_id in room_data['allowed_users']
+            
+        if permission == RoomPermission.RESTRICTED:
+            return bool(room_data['allowed_roles'] & user_roles)
+            
+        if permission == RoomPermission.OWNER_ONLY:
+            return user_id == room_data['owner_id']
+            
+        return False
 
     def _register_handlers(self):
         """Register all WebSocket event handlers."""
@@ -51,6 +101,7 @@ class WebSocketModule:
         self.websocket_manager.register_authenticated_handler('message', self._handle_message)
         self.websocket_manager.register_authenticated_handler('button_press', self._handle_button_press)
         self.websocket_manager.register_authenticated_handler('get_counter', self._handle_get_counter)
+        self.websocket_manager.register_authenticated_handler('get_users', self._handle_get_users)
         custom_log("WebSocket event handlers registered")
 
     def _validate_token(self, token: str) -> Optional[Dict[str, Any]]:
@@ -62,7 +113,7 @@ class WebSocketModule:
                 return None
                 
             # Get user data from Redis cache
-            user_data = self.redis_manager.get(f"user:{payload['user_id']}")
+            user_data = self.redis_manager.get(f"user:{payload['id']}")
             if not user_data:
                 return None
                 
@@ -110,6 +161,7 @@ class WebSocketModule:
             'client_id': client_id,
             'origin': origin,
             'user_id': user_data['id'],
+            'username': user_data['username'],
             'connected_at': datetime.utcnow().isoformat(),
             'last_active': datetime.utcnow().isoformat()
         }
@@ -118,12 +170,31 @@ class WebSocketModule:
         # Join button counter room
         self.websocket_manager.join_room(self.button_counter_room, session_id)
         
+        # Broadcast user joined event
+        self.websocket_manager.broadcast_to_room(
+            self.button_counter_room,
+            'user_joined',
+            {'username': user_data['username']}
+        )
+        
         custom_log(f"New WebSocket connection: {session_id} from {origin} for user {user_data['id']}")
         return {'status': 'connected', 'session_id': session_id}
 
     def _handle_disconnect(self, data=None):
         """Handle WebSocket disconnections with cleanup."""
         session_id = request.sid
+        
+        # Get user data before cleanup
+        session_data = self.websocket_manager.get_session_data(session_id)
+        if session_data:
+            username = session_data.get('username')
+            if username:
+                # Broadcast user left event
+                self.websocket_manager.broadcast_to_room(
+                    self.button_counter_room,
+                    'user_left',
+                    {'username': username}
+                )
         
         # Clean up session data
         self.websocket_manager.cleanup_session_data(session_id)
@@ -133,11 +204,19 @@ class WebSocketModule:
         custom_log(f"WebSocket disconnected: {session_id}")
 
     def _handle_join(self, data: Dict[str, Any], session_data: Dict[str, Any]):
-        """Handle joining a room with authentication."""
+        """Handle joining a room with authentication and permission checks."""
         session_id = request.sid
         room_id = data.get('room_id')
         if not room_id:
             raise ValueError("room_id is required")
+            
+        # Get user roles from session data
+        user_roles = set(session_data.get('roles', []))
+        
+        # Check room access permission
+        if not self._check_room_access(room_id, session_data['user_id'], user_roles):
+            custom_log(f"Access denied for user {session_data['user_id']} to room {room_id}")
+            return {'status': 'error', 'message': 'Access denied to room'}
         
         self.websocket_manager.join_room(room_id, session_id)
         return {'status': 'joined', 'room_id': room_id}
@@ -207,6 +286,18 @@ class WebSocketModule:
         current_count = self.redis_manager.get(counter_key) or 0
         return {'status': 'success', 'count': current_count}
 
+    def _handle_get_users(self, data: Dict[str, Any]):
+        """Handle getting the list of connected users."""
+        room_members = self.get_room_members(self.button_counter_room)
+        users = []
+        
+        for session_id in room_members:
+            session_data = self.websocket_manager.get_session_data(session_id)
+            if session_data and 'username' in session_data:
+                users.append(session_data['username'])
+        
+        return {'status': 'success', 'users': users}
+
     def broadcast_to_room(self, room_id: str, event: str, data: Any):
         """Broadcast message to a specific room."""
         self.websocket_manager.broadcast_to_room(room_id, event, data)
@@ -222,3 +313,49 @@ class WebSocketModule:
     def get_rooms_for_session(self, session_id: str) -> set:
         """Get all rooms for a session."""
         return self.websocket_manager.get_rooms_for_session(session_id)
+
+    def create_room(self, room_id: str, permission: RoomPermission, owner_id: str, 
+                   allowed_users: Set[str] = None, allowed_roles: Set[str] = None) -> Dict[str, Any]:
+        """Create a new room with specified permissions."""
+        if room_id in self.room_permissions:
+            raise ValueError(f"Room {room_id} already exists")
+            
+        room_data = {
+            'permission': permission,
+            'owner_id': owner_id,
+            'allowed_users': allowed_users or set(),
+            'allowed_roles': allowed_roles or set(),
+            'created_at': datetime.utcnow().isoformat()
+        }
+        
+        self.room_permissions[room_id] = room_data
+        custom_log(f"Created new room {room_id} with permission {permission.value}")
+        return room_data
+
+    def update_room_permissions(self, room_id: str, permission: RoomPermission = None,
+                              allowed_users: Set[str] = None, allowed_roles: Set[str] = None) -> Dict[str, Any]:
+        """Update room permissions."""
+        if room_id not in self.room_permissions:
+            raise ValueError(f"Room {room_id} not found")
+            
+        room_data = self.room_permissions[room_id]
+        
+        if permission:
+            room_data['permission'] = permission
+        if allowed_users is not None:
+            room_data['allowed_users'] = allowed_users
+        if allowed_roles is not None:
+            room_data['allowed_roles'] = allowed_roles
+            
+        custom_log(f"Updated permissions for room {room_id}")
+        return room_data
+
+    def get_room_permissions(self, room_id: str) -> Optional[Dict[str, Any]]:
+        """Get room permissions."""
+        return self.room_permissions.get(room_id)
+
+    def delete_room(self, room_id: str):
+        """Delete a room and its permissions."""
+        if room_id in self.room_permissions:
+            del self.room_permissions[room_id]
+            custom_log(f"Deleted room {room_id}")

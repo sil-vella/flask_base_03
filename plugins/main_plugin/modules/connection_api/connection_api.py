@@ -6,6 +6,7 @@ import json
 from tools.logger.custom_logging import custom_log, log_function_call
 from utils.config.config import Config
 from core.managers.redis_manager import RedisManager
+from core.managers.jwt_manager import JWTManager, TokenType
 from tools.error_handling import ErrorHandler
 from datetime import datetime
 import time
@@ -20,6 +21,7 @@ class ConnectionAPI:
         self.app_manager = app_manager  # Reference to AppManager if provided
         self.connection_pool = self._create_connection_pool()  # Initialize PostgreSQL connection pool
         self.redis_manager = RedisManager()  # Initialize Redis manager
+        self.jwt_manager = JWTManager()  # Initialize JWT manager
         self.error_handler = ErrorHandler()  # Initialize error handler
         self.logger = logging.getLogger(__name__)
         
@@ -298,19 +300,41 @@ class ConnectionAPI:
         custom_log("✅ Database tables verified.")
 
     def _create_users_table(self):
-        """Create users table if it doesn't exist."""
+        """Create users table with proper constraints and indexes."""
         query = """
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
-            username VARCHAR(50) UNIQUE NOT NULL,
-            email VARCHAR(100) UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            total_points INT DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            username VARCHAR(255) NOT NULL,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            password VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
         """
         self.execute_query(query)
-        custom_log("✅ Users table verified.")
+
+    def get_user_by_email(self, email):
+        """Get user by email with proper error handling."""
+        query = "SELECT id, username, password, email FROM users WHERE email = %s;"
+        return self.fetch_from_db(query, (email,), as_dict=True)
+
+    def create_user(self, username, email, hashed_password):
+        """Create a new user with proper error handling."""
+        query = "INSERT INTO users (username, email, password) VALUES (%s, %s, %s);"
+        self.execute_query(query, (username, email, hashed_password))
+        return self.get_user_by_email(email)
+
+    def delete_user(self, user_id):
+        """Delete a user and all associated data with proper error handling."""
+        # Delete guessed names
+        self.execute_query("DELETE FROM guessed_names WHERE user_id = %s", (user_id,))
+        # Delete user progress
+        self.execute_query("DELETE FROM user_category_progress WHERE user_id = %s", (user_id,))
+        # Delete the user
+        self.execute_query("DELETE FROM users WHERE id = %s", (user_id,))
+        # Invalidate any cached user data
+        self._invalidate_caches(f"user:{user_id}")
 
     def register_route(self, path, view_func, methods=None, endpoint=None):
         """Register a route with the Flask app."""
@@ -415,205 +439,164 @@ class ConnectionAPI:
         
         custom_log("✅ Relevant caches invalidated")
 
-    def _create_session(self, user_id: int) -> str:
-        """Create a new session for a user."""
+    def _create_session(self, user_id, session_data=None):
+        """Create a new session with JWT support."""
         try:
-            # Check concurrent session limit using Redis set
-            user_sessions_key = f"user_sessions:{user_id}"
-            active_session_count = self.redis_manager.redis.scard(user_sessions_key)
+            session_id = str(uuid.uuid4())
+            current_time = time.time()
             
-            if active_session_count >= self.max_concurrent_sessions:
-                raise ValueError(f"Maximum concurrent sessions ({self.max_concurrent_sessions}) reached for user {user_id}")
+            # Get existing sessions
+            sessions = self.redis_manager.get(f"user_sessions:{user_id}", default=[])
+            if not isinstance(sessions, list):
+                sessions = []
             
-            # Generate session ID
-            session_id = f"session:{user_id}:{uuid.uuid4().hex}"
+            # Check concurrent sessions limit
+            if len(sessions) >= self.max_concurrent_sessions:
+                # Remove oldest session
+                sessions.pop(0)
             
-            # Create session data
-            session_data = {
-                "user_id": user_id,
-                "created_at": datetime.utcnow().isoformat(),
-                "last_activity": datetime.utcnow().isoformat(),
-                "ip_address": None,  # To be set by web layer
-                "user_agent": None   # To be set by web layer
+            # Create new session
+            new_session = {
+                "session_id": session_id,
+                "created_at": current_time,
+                "last_active": current_time,
+                "data": session_data or {}
             }
             
-            # Store session in Redis
-            self.redis_manager.redis.setex(
-                session_id,
-                self.session_timeout,
-                json.dumps(session_data)
+            # Add new session
+            sessions.append(new_session)
+            
+            # Store updated sessions
+            self.redis_manager.set(
+                f"user_sessions:{user_id}",
+                sessions,
+                expire=self.session_timeout
             )
             
-            # Add to user's active sessions using Redis set
-            self.redis_manager.redis.sadd(user_sessions_key, session_id)
-            
-            self.logger.info(f"Created new session {session_id} for user {user_id}")
             return session_id
             
         except Exception as e:
-            self.logger.error(f"Failed to create session for user {user_id}: {str(e)}")
-            raise
+            custom_log(f"❌ Error creating session: {e}")
+            return None
 
-    def _get_active_sessions(self, user_id):
-        """Get all active sessions for a user."""
+    def _validate_session(self, user_id, session_id):
+        """Validate a session with JWT support."""
         try:
-            # Get all session keys for the user
-            pattern = f"session:{user_id}:*"
-            session_keys = self.redis_manager.redis.keys(pattern)
-            
-            active_sessions = []
-            current_time = datetime.utcnow()
-            
-            for key in session_keys:
-                session_data = self.redis_manager.redis.get(key)
-                if session_data:
-                    session_data = json.loads(session_data)
-                    # Parse last activity time from ISO format
-                    last_activity = datetime.fromisoformat(session_data["last_activity"])
-                    
-                    # Check if session is still active
-                    if (current_time - last_activity).total_seconds() < self.session_timeout:
-                        active_sessions.append(session_data)
-                    else:
-                        # Clean up expired session
-                        self.redis_manager.redis.delete(key)
-                        # Also remove from user's sessions set
-                        self.redis_manager.redis.srem(f"user_sessions:{user_id}", key)
-            
-            return active_sessions
-        except Exception as e:
-            error_response = self.error_handler.handle_error(e, "get_active_sessions")
-            custom_log(f"❌ Error getting active sessions: {error_response['error']}")
-            return []
-
-    def _update_session_activity(self, session_id):
-        """Update the last activity time of a session."""
-        try:
-            session_data = self.redis_manager.redis.get(session_id)
-            if session_data:
-                session_data = json.loads(session_data)
-                session_data["last_activity"] = datetime.utcnow().isoformat()
-                self.redis_manager.redis.setex(
-                    session_id,
-                    self.session_timeout,
-                    json.dumps(session_data)
-                )
-                return True
-            return False
-        except Exception as e:
-            error_response = self.error_handler.handle_error(e, "update_session_activity")
-            custom_log(f"❌ Error updating session activity: {error_response['error']}")
-            return False
-
-    def _validate_session(self, session_id):
-        """Validate a session and return session data if valid."""
-        try:
-            session_data = self.redis_manager.redis.get(session_id)
-            if not session_data:
-                return None
+            sessions = self.redis_manager.get(f"user_sessions:{user_id}", default=[])
+            if not isinstance(sessions, list):
+                return False
                 
-            session_data = json.loads(session_data)
-            # Parse last activity time from ISO format
-            last_activity = datetime.fromisoformat(session_data["last_activity"])
-            current_time = datetime.utcnow()
-            
-            # Check if session has expired
-            if (current_time - last_activity).total_seconds() > self.session_timeout:
-                # Session expired
-                self.redis_manager.redis.delete(session_id)
-                return None
+            # Find session
+            session = next((s for s in sessions if s["session_id"] == session_id), None)
+            if not session:
+                return False
                 
-            # Update last activity
-            session_data["last_activity"] = current_time.isoformat()
-            self.redis_manager.redis.setex(
-                session_id,
-                self.session_timeout,
-                json.dumps(session_data)
+            # Check session timeout
+            if time.time() - session["last_active"] > self.session_timeout:
+                self._remove_session(user_id, session_id)
+                return False
+                
+            # Update last active time
+            session["last_active"] = time.time()
+            self.redis_manager.set(
+                f"user_sessions:{user_id}",
+                sessions,
+                expire=self.session_timeout
             )
             
-            return session_data
+            return True
+            
         except Exception as e:
-            error_response = self.error_handler.handle_error(e, "validate_session")
-            custom_log(f"❌ Error validating session: {error_response['error']}")
+            custom_log(f"❌ Error validating session: {e}")
+            return False
+
+    def create_user_tokens(self, user_data):
+        """Create access and refresh tokens for a user."""
+        try:
+            # Create access token
+            access_token = self.jwt_manager.create_token(
+                user_data,
+                token_type=TokenType.ACCESS,
+                expires_in=3600  # 1 hour
+            )
+            
+            # Create refresh token
+            refresh_token = self.jwt_manager.create_token(
+                user_data,
+                token_type=TokenType.REFRESH,
+                expires_in=604800  # 7 days
+            )
+            
+            # Store tokens in Redis
+            self.redis_manager.set(
+                f"user_tokens:{user_data['id']}",  # Changed from user_id to id
+                {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "created_at": time.time()
+                },
+                expire=604800  # 7 days
+            )
+
+            return {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "bearer"
+            }
+
+        except Exception as e:
+            custom_log(f"❌ Error creating user tokens: {e}")
+            raise
+
+    def validate_access_token(self, token):
+        """Validate an access token."""
+        try:
+            return self.jwt_manager.validate_token(token, TokenType.ACCESS)
+        except Exception as e:
+            custom_log(f"❌ Error validating access token: {e}")
             return None
 
-    def _cleanup_expired_sessions(self):
-        """Clean up expired sessions for all users."""
+    def refresh_user_tokens(self, refresh_token):
+        """Refresh user tokens using a valid refresh token."""
         try:
-            # Get all session keys
-            pattern = "session:*"
-            session_keys = self.redis_manager.redis.keys(pattern)
-            
-            current_time = datetime.utcnow()
-            for key in session_keys:
-                session_data = self.redis_manager.redis.get(key)
-                if session_data:
-                    session_data = json.loads(session_data)
-                    # Parse last activity time from ISO format
-                    last_activity = datetime.fromisoformat(session_data["last_activity"])
-                    
-                    # Check if session has expired
-                    if (current_time - last_activity).total_seconds() > self.session_timeout:
-                        # Get user_id from session key
-                        user_id = key.split(":")[1]
-                        
-                        # Delete session
-                        self.redis_manager.redis.delete(key)
-                        # Also remove from user's sessions set
-                        self.redis_manager.redis.srem(f"user_sessions:{user_id}", key)
-                        custom_log(f"✅ Cleaned up expired session: {key}")
-        except Exception as e:
-            error_response = self.error_handler.handle_error(e, "cleanup_expired_sessions")
-            custom_log(f"❌ Error cleaning up expired sessions: {error_response['error']}")
-
-    def _terminate_session(self, session_id):
-        """Terminate a specific session."""
-        try:
-            # Get user_id from session key
-            user_id = session_id.split(":")[1]
-            
-            # Delete session
-            self.redis_manager.redis.delete(session_id)
-            # Also remove from user's sessions set
-            self.redis_manager.redis.srem(f"user_sessions:{user_id}", session_id)
-            custom_log(f"✅ Terminated session: {session_id}")
-        except Exception as e:
-            error_response = self.error_handler.handle_error(e, "terminate_session")
-            custom_log(f"❌ Error terminating session: {error_response['error']}")
-
-    def _terminate_user_sessions(self, user_id):
-        """Terminate all sessions for a user."""
-        try:
-            pattern = f"session:{user_id}:*"
-            session_keys = self.redis_manager.redis.keys(pattern)
-            for key in session_keys:
-                # Delete session
-                self.redis_manager.redis.delete(key)
-                # Also remove from user's sessions set
-                self.redis_manager.redis.srem(f"user_sessions:{user_id}", key)
-            custom_log(f"✅ Terminated all sessions for user: {user_id}")
-        except Exception as e:
-            error_response = self.error_handler.handle_error(e, "terminate_user_sessions")
-            custom_log(f"❌ Error terminating user sessions: {error_response['error']}")
-
-    def _get_session_info(self, session_id):
-        """Get detailed information about a session."""
-        try:
-            session_data = self.redis_manager.redis.get(session_id)
-            if not session_data:
+            # Validate refresh token
+            payload = self.jwt_manager.validate_token(refresh_token, TokenType.REFRESH)
+            if not payload:
                 return None
                 
-            session_data = json.loads(session_data)
-            return {
-                "session_id": session_id,
-                "user_id": session_data["user_id"],
-                "created_at": session_data["created_at"],
-                "last_activity": session_data["last_activity"],
-                "timeout": self.session_timeout,
-                "ip_address": session_data.get("ip_address"),
-                "user_agent": session_data.get("user_agent")
-            }
+            user_id = payload.get('id')  # Changed from user_id to id
+            if not user_id:
+                return None
+                
+            # Get user data from Redis
+            user_data = self.redis_manager.get(f"user:{user_id}")
+            if not user_data:
+                return None
+                
+            # Create new tokens
+            return self.create_user_tokens(user_data)
+
         except Exception as e:
-            error_response = self.error_handler.handle_error(e, "get_session_info")
-            custom_log(f"❌ Error getting session info: {error_response['error']}")
+            custom_log(f"❌ Error refreshing user tokens: {e}")
             return None
+
+    def revoke_user_tokens(self, user_id):
+        """Revoke all tokens for a user."""
+        try:
+            # Delete tokens from Redis
+            self.redis_manager.delete(f"user_tokens:{user_id}")
+            return True
+        except Exception as e:
+            custom_log(f"❌ Error revoking user tokens: {e}")
+            return False
+
+    def _remove_session(self, user_id, session_id):
+        """Remove a session from the user's session list."""
+        sessions = self.redis_manager.get(f"user_sessions:{user_id}", default=[])
+        if isinstance(sessions, list):
+            sessions = [s for s in sessions if s["session_id"] != session_id]
+            self.redis_manager.set(
+                f"user_sessions:{user_id}",
+                sessions,
+                expire=self.session_timeout
+            )
