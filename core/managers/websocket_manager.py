@@ -36,6 +36,8 @@ class WebSocketManager:
         }
         self._jwt_manager = None  # Will be set by the module
         self._room_access_check = None  # Will be set by the module
+        self._room_size_limit = Config.WS_ROOM_SIZE_LIMIT
+        self._room_size_check_interval = Config.WS_ROOM_SIZE_CHECK_INTERVAL
         custom_log("WebSocketManager initialized")
 
     def set_cors_origins(self, origins: list):
@@ -191,42 +193,86 @@ class WebSocketManager:
             return True
         return False
 
+    def get_room_size(self, room_id: str) -> int:
+        """Get the current number of users in a room."""
+        # Try to get from Redis first
+        redis_key = f"ws:room:{room_id}:size"
+        size = self.redis_manager.get(redis_key)
+        if size is not None:
+            return int(size)
+            
+        # If not in Redis, count from memory
+        return len(self.rooms.get(room_id, set()))
+
+    def update_room_size(self, room_id: str, delta: int):
+        """Update the room size in Redis."""
+        redis_key = f"ws:room:{room_id}:size"
+        current_size = self.get_room_size(room_id)
+        new_size = max(0, current_size + delta)
+        self.redis_manager.set(redis_key, str(new_size), expire=self._room_size_check_interval)
+
+    def check_room_size_limit(self, room_id: str) -> bool:
+        """Check if a room has reached its size limit."""
+        current_size = self.get_room_size(room_id)
+        return current_size >= self._room_size_limit
+
     def join_room(self, room_id: str, session_id: str, user_id: str = None, user_roles: Set[str] = None):
-        """Join a room with access control."""
+        """Join a room with access control and size limit check."""
         # Validate room ID
         error = self.validator.validate_room_id(room_id)
         if error:
             custom_log(f"Invalid room ID: {error}")
             return False
-
-        # If user_id and roles are provided, check access
-        if user_id and user_roles and not self.check_room_access(room_id, user_id, user_roles):
-            custom_log(f"Access denied for user {user_id} to room {room_id}")
+            
+        # Check room access
+        if not self.check_room_access(room_id, user_id, user_roles):
+            custom_log(f"Access denied to room {room_id} for user {user_id}")
             return False
-
-        self.create_room(room_id)
-        join_room(room_id)
+            
+        # Check room size limit
+        if self.check_room_size_limit(room_id):
+            custom_log(f"Room {room_id} has reached its size limit")
+            return False
+            
+        # Join the room
+        join_room(room_id, sid=session_id)
         
-        # Update room membership
+        # Update room tracking
+        if room_id not in self.rooms:
+            self.rooms[room_id] = set()
         self.rooms[room_id].add(session_id)
+        
         if session_id not in self.session_rooms:
             self.session_rooms[session_id] = set()
         self.session_rooms[session_id].add(room_id)
+        
+        # Update room size in Redis
+        self.update_room_size(room_id, 1)
         
         custom_log(f"Session {session_id} joined room {room_id}")
         return True
 
     def leave_room(self, room_id: str, session_id: str):
-        """Leave a room with cleanup."""
-        leave_room(room_id)
+        """Leave a room and update room size."""
+        # Leave the room
+        leave_room(room_id, sid=session_id)
         
-        # Update room membership
+        # Update room tracking
         if room_id in self.rooms:
             self.rooms[room_id].discard(session_id)
+            if not self.rooms[room_id]:
+                del self.rooms[room_id]
+                
         if session_id in self.session_rooms:
             self.session_rooms[session_id].discard(room_id)
-            
+            if not self.session_rooms[session_id]:
+                del self.session_rooms[session_id]
+                
+        # Update room size in Redis
+        self.update_room_size(room_id, -1)
+        
         custom_log(f"Session {session_id} left room {room_id}")
+        return True
 
     def broadcast_to_room(self, room_id: str, event: str, data: Dict[str, Any]):
         """Broadcast an event to all users in a room."""
@@ -275,6 +321,8 @@ class WebSocketManager:
             for room_id in self.session_rooms[session_id]:
                 if room_id in self.rooms:
                     self.rooms[room_id].discard(session_id)
+                    # Update room size in Redis
+                    self.update_room_size(room_id, -1)
             del self.session_rooms[session_id]
             
         custom_log(f"Cleaned up session {session_id}")

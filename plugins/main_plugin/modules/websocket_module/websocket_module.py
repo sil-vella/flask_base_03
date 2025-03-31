@@ -39,6 +39,9 @@ class WebSocketModule:
         # Initialize room permissions
         self._initialize_room_permissions()
         
+        # Set room access check function
+        self.websocket_manager.set_room_access_check(self._check_room_access)
+        
         self._register_handlers()
         custom_log("WebSocketModule initialized")
 
@@ -167,8 +170,15 @@ class WebSocketModule:
         }
         self.websocket_manager.store_session_data(session_id, session_data)
         
-        # Join button counter room
-        self.websocket_manager.join_room(self.button_counter_room, session_id)
+        # Join button counter room with user ID and roles
+        if not self.websocket_manager.join_room(
+            self.button_counter_room, 
+            session_id,
+            user_id=str(user_data['id']),  # Convert to string for consistency
+            user_roles=set(user_data.get('roles', []))  # Get roles from user data
+        ):
+            custom_log(f"Failed to join room {self.button_counter_room} for user {user_data['id']}")
+            return {'status': 'error', 'message': 'Failed to join room'}
         
         # Broadcast user joined event
         self.websocket_manager.broadcast_to_room(
@@ -189,6 +199,9 @@ class WebSocketModule:
         if session_data:
             username = session_data.get('username')
             if username:
+                # Leave the room before cleanup
+                self.websocket_manager.leave_room(self.button_counter_room, session_id)
+                
                 # Broadcast user left event
                 self.websocket_manager.broadcast_to_room(
                     self.button_counter_room,

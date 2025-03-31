@@ -4,6 +4,24 @@ class Config:
     # Debug mode
     DEBUG = os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1")
 
+    # JWT Configuration
+    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-key-change-in-production")
+    JWT_ACCESS_TOKEN_EXPIRES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRES", "3600"))  # 1 hour in seconds
+    JWT_REFRESH_TOKEN_EXPIRES = int(os.getenv("JWT_REFRESH_TOKEN_EXPIRES", "604800"))  # 7 days in seconds
+    JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+    JWT_TOKEN_TYPE = os.getenv("JWT_TOKEN_TYPE", "bearer")
+    JWT_HEADER_NAME = os.getenv("JWT_HEADER_NAME", "Authorization")
+    JWT_HEADER_TYPE = os.getenv("JWT_HEADER_TYPE", "Bearer")
+    JWT_QUERY_STRING_NAME = os.getenv("JWT_QUERY_STRING_NAME", "token")
+    JWT_QUERY_STRING_VALUE_PREFIX = os.getenv("JWT_QUERY_STRING_VALUE_PREFIX", "Bearer")
+    JWT_COOKIE_NAME = os.getenv("JWT_COOKIE_NAME", "access_token")
+    JWT_COOKIE_CSRF_PROTECT = os.getenv("JWT_COOKIE_CSRF_PROTECT", "true").lower() == "true"
+    JWT_COOKIE_SECURE = os.getenv("JWT_COOKIE_SECURE", "true").lower() == "true"
+    JWT_COOKIE_SAMESITE = os.getenv("JWT_COOKIE_SAMESITE", "Lax")
+    JWT_COOKIE_DOMAIN = os.getenv("JWT_COOKIE_DOMAIN", None)
+    JWT_COOKIE_PATH = os.getenv("JWT_COOKIE_PATH", "/")
+    JWT_COOKIE_MAX_AGE = int(os.getenv("JWT_COOKIE_MAX_AGE", "3600"))  # 1 hour in seconds
+
     # Toggle SSL for PostgreSQL
     USE_SSL = os.getenv("USE_SSL", "False").lower() in ("true", "1")
 
@@ -60,3 +78,7 @@ class Config:
     WS_MAX_PAYLOAD_SIZE = int(os.getenv("WS_MAX_PAYLOAD_SIZE", "1048576"))  # 1MB in bytes
     WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "60"))  # Ping timeout in seconds
     WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "25"))  # Ping interval in seconds
+    
+    # Room Size Limits
+    WS_ROOM_SIZE_LIMIT = int(os.getenv("WS_ROOM_SIZE_LIMIT", "2"))  # Maximum users per room
+    WS_ROOM_SIZE_CHECK_INTERVAL = int(os.getenv("WS_ROOM_SIZE_CHECK_INTERVAL", "60"))  # Check interval in seconds
