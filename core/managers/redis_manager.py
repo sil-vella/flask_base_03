@@ -299,37 +299,129 @@ class RedisManager:
         except Exception as e:
             custom_log(f"❌ Error disposing Redis connection pool: {e}")
 
+    def set_room_size(self, room_id: str, size: int, expire: int = 3600) -> bool:
+        """Set room size in Redis without encryption."""
+        try:
+            key = f"ws:room:{room_id}:size"
+            self.redis.set(key, str(size))  # Convert int to string
+            if expire:
+                self.redis.expire(key, expire)
+            custom_log(f"Set room size for {room_id} to {size}")
+            return True
+        except Exception as e:
+            custom_log(f"Error setting room size for {room_id}: {str(e)}")
+            return False
+
     def get_room_size(self, room_id: str) -> int:
         """Get room size from Redis without encryption."""
         try:
             key = f"ws:room:{room_id}:size"
             value = self.redis.get(key)
-            return int(value) if value is not None else 0
+            size = int(value) if value is not None else 0
+            custom_log(f"Got room size for {room_id}: {size}")
+            return size
         except Exception as e:
-            custom_log(f"❌ Error getting room size from Redis: {e}")
+            custom_log(f"Error getting room size from Redis: {str(e)}")
             return 0
 
     def update_room_size(self, room_id: str, delta: int) -> bool:
         """Update room size in Redis without encryption."""
         try:
             key = f"ws:room:{room_id}:size"
-            if delta > 0:
-                self.redis.incr(key)
-            else:
-                self.redis.decr(key)
-            # Set expiration to prevent stale data
-            self.redis.expire(key, Config.WS_ROOM_SIZE_CHECK_INTERVAL)
-            return True
+            custom_log(f"Updating room size for {room_id} with delta {delta}")
+            
+            # Get current size first
+            current_size = self.get_room_size(room_id)
+            custom_log(f"Current room size for {room_id}: {current_size}")
+            
+            # Calculate new size
+            new_size = max(0, current_size + delta)  # Ensure size doesn't go below 0
+            
+            # Set new size
+            return self.set_room_size(room_id, new_size)
+            
         except Exception as e:
-            custom_log(f"❌ Error updating room size in Redis: {e}")
+            custom_log(f"Error updating room size for {room_id}: {str(e)}")
+            return False
+
+    def check_and_increment_room_size(self, room_id: str, limit: int) -> bool:
+        """Atomically check and increment room size if under limit."""
+        try:
+            key = f"ws:room:{room_id}:size"
+            custom_log(f"Checking room size for {room_id} with limit {limit}")
+            
+            # Use Redis transaction for atomicity
+            with self.redis.pipeline() as pipe:
+                while True:
+                    try:
+                        # Watch the key for changes
+                        pipe.watch(key)
+                        
+                        # Get current size
+                        current_size = self.get_room_size(room_id)
+                        custom_log(f"Current room size for {room_id}: {current_size}")
+                        
+                        # Check limit
+                        if current_size >= limit:
+                            custom_log(f"Room {room_id} has reached its size limit of {limit}")
+                            pipe.unwatch()
+                            return False
+                        
+                        # Start transaction
+                        pipe.multi()
+                        
+                        # Increment size
+                        new_size = current_size + 1
+                        pipe.set(key, str(new_size))
+                        pipe.expire(key, 3600)  # 1 hour expiration
+                        
+                        # Execute transaction
+                        pipe.execute()
+                        custom_log(f"Successfully incremented room size for {room_id} to {new_size}")
+                        return True
+                        
+                    except redis.WatchError:
+                        # Another client modified the key while we were working
+                        custom_log(f"Retrying room size increment for {room_id} due to concurrent modification")
+                        continue
+                    
+        except Exception as e:
+            custom_log(f"Error checking and incrementing room size for {room_id}: {str(e)}")
             return False
 
     def reset_room_size(self, room_id: str) -> bool:
-        """Reset room size in Redis without encryption."""
+        """Reset room size in Redis."""
         try:
             key = f"ws:room:{room_id}:size"
             self.redis.delete(key)
+            custom_log(f"Reset room size for {room_id}")
             return True
         except Exception as e:
-            custom_log(f"❌ Error resetting room size in Redis: {e}")
+            custom_log(f"Error resetting room size for {room_id}: {str(e)}")
+            return False
+
+    def cleanup_room_keys(self, room_id: str) -> bool:
+        """Clean up all Redis keys related to a room using pattern matching."""
+        try:
+            # Pattern to match all room-related keys
+            pattern = f"ws:room:{room_id}:*"
+            cursor = 0
+            cleaned = 0
+            
+            while True:
+                cursor, keys = self.redis.scan(cursor, match=pattern, count=100)
+                for key in keys:
+                    custom_log(f"Found room key: {key}")
+                    self.redis.delete(key)
+                    cleaned += 1
+                    custom_log(f"Deleted room key: {key}")
+                    
+                if cursor == 0:
+                    break
+                    
+            custom_log(f"Cleaned up {cleaned} keys for room {room_id}")
+            return True
+            
+        except Exception as e:
+            custom_log(f"Error cleaning up room keys for {room_id}: {str(e)}")
             return False 

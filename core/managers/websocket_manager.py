@@ -1,6 +1,6 @@
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask import request
-from typing import Dict, Any, Set, Callable, Optional
+from typing import Dict, Any, Set, Callable, Optional, List
 from tools.logger.custom_logging import custom_log
 from core.managers.redis_manager import RedisManager
 from core.validators.websocket_validators import WebSocketValidator
@@ -8,6 +8,7 @@ from utils.config.config import Config
 import time
 from datetime import datetime
 from functools import wraps
+import json
 
 class WebSocketManager:
     def __init__(self):
@@ -38,6 +39,9 @@ class WebSocketManager:
         self._room_access_check = None  # Will be set by the module
         self._room_size_limit = Config.WS_ROOM_SIZE_LIMIT
         self._room_size_check_interval = Config.WS_ROOM_SIZE_CHECK_INTERVAL
+        self._presence_check_interval = Config.WS_PRESENCE_CHECK_INTERVAL
+        self._presence_timeout = Config.WS_PRESENCE_TIMEOUT
+        self._presence_cleanup_interval = Config.WS_PRESENCE_CLEANUP_INTERVAL
         custom_log("WebSocketManager initialized")
 
     def set_cors_origins(self, origins: list):
@@ -97,6 +101,51 @@ class WebSocketManager:
     def initialize(self, app):
         """Initialize WebSocket support with the Flask app."""
         self.socketio.init_app(app)
+        
+        # Register connection handlers
+        @self.socketio.on('connect')
+        def handle_connect():
+            try:
+                session_id = request.sid
+                custom_log(f"New WebSocket connection: {session_id}")
+                
+                # Get session data
+                session_data = self.get_session_data(session_id)
+                if not session_data:
+                    custom_log(f"No session data found for {session_id}")
+                    return False
+                    
+                # Update session activity
+                self.update_session_activity(session_id)
+                
+                # Update user presence
+                self.update_user_presence(session_id, 'online')
+                
+                # Reset room sizes to ensure accuracy
+                self.reset_room_sizes()
+                
+                return True
+            except Exception as e:
+                custom_log(f"Error handling WebSocket connection: {str(e)}")
+                return False
+                
+        @self.socketio.on('disconnect')
+        def handle_disconnect():
+            try:
+                session_id = request.sid
+                custom_log(f"WebSocket disconnected: {session_id}")
+                
+                # Clean up session
+                self.cleanup_session(session_id)
+                
+                # Reset room sizes to ensure accuracy
+                self.reset_room_sizes()
+                
+                return True
+            except Exception as e:
+                custom_log(f"Error handling WebSocket disconnection: {str(e)}")
+                return False
+                
         custom_log("WebSocket support initialized with Flask app")
 
     def set_jwt_manager(self, jwt_manager):
@@ -238,63 +287,211 @@ class WebSocketManager:
         current_size = self.get_room_size(room_id)
         return current_size >= self._room_size_limit
 
+    def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get session information."""
+        return self.get_session_data(session_id)
+
+    def update_user_presence(self, session_id: str, status: str = 'online'):
+        """Update user presence status."""
+        try:
+            custom_log(f"Updating presence for session {session_id} to status: {status}")
+            session_info = self.get_session_info(session_id)
+            if not session_info or 'user_id' not in session_info:
+                custom_log(f"No valid session info found for session {session_id}")
+                return
+                
+            user_id = session_info['user_id']
+            presence_key = f"ws:presence:{user_id}"
+            
+            presence_data = {
+                'status': status,
+                'last_seen': datetime.utcnow().isoformat(),
+                'session_id': session_id,
+                'username': session_info.get('username', 'Anonymous')
+            }
+            
+            custom_log(f"Setting presence data for user {user_id}: {presence_data}")
+            self.redis_manager.set(presence_key, presence_data, expire=self._presence_timeout)
+            
+            # Broadcast presence update to all rooms the user is in
+            rooms = self.get_rooms_for_session(session_id)
+            custom_log(f"Broadcasting presence update to rooms: {rooms}")
+            for room_id in rooms:
+                self.broadcast_to_room(room_id, 'presence_update', {
+                    'user_id': user_id,
+                    'status': status,
+                    'username': presence_data['username']
+                })
+                
+        except Exception as e:
+            custom_log(f"Error updating presence for session {session_id}: {str(e)}")
+
+    def get_user_presence(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Get user presence information."""
+        try:
+            custom_log(f"Getting presence for user {user_id}")
+            presence_key = f"ws:presence:{user_id}"
+            presence_data = self.redis_manager.get(presence_key)
+            
+            if not presence_data:
+                custom_log(f"No presence data found for user {user_id}")
+                return {
+                    'user_id': user_id,
+                    'status': 'offline',
+                    'last_seen': None
+                }
+                
+            # Check if presence is stale
+            last_seen = datetime.fromisoformat(presence_data['last_seen'])
+            if (datetime.utcnow() - last_seen).total_seconds() > self._presence_timeout:
+                custom_log(f"Presence data for user {user_id} is stale, marking as offline")
+                presence_data['status'] = 'offline'
+                
+            custom_log(f"Retrieved presence data for user {user_id}: {presence_data}")
+            return presence_data
+            
+        except Exception as e:
+            custom_log(f"Error getting presence for user {user_id}: {str(e)}")
+            return None
+
+    def get_room_presence(self, room_id: str) -> List[Dict[str, Any]]:
+        """Get presence information for all users in a room."""
+        try:
+            custom_log(f"Getting presence for room {room_id}")
+            room_members = self.get_room_members(room_id)
+            presence_list = []
+            
+            for session_id in room_members:
+                session_info = self.get_session_info(session_id)
+                if session_info and 'user_id' in session_info:
+                    presence_data = self.get_user_presence(session_info['user_id'])
+                    if presence_data:
+                        presence_list.append(presence_data)
+                        
+            custom_log(f"Room {room_id} presence list: {presence_list}")
+            return presence_list
+            
+        except Exception as e:
+            custom_log(f"Error getting room presence for {room_id}: {str(e)}")
+            return []
+
+    def cleanup_stale_presence(self):
+        """Clean up stale presence records."""
+        try:
+            custom_log("Starting stale presence cleanup")
+            # This would be called periodically to clean up stale presence records
+            # Implementation would depend on Redis key pattern matching capabilities
+            custom_log("Completed stale presence cleanup")
+            
+        except Exception as e:
+            custom_log(f"Error cleaning up stale presence: {str(e)}")
+
     def join_room(self, room_id: str, session_id: str, user_id: str = None, user_roles: Set[str] = None):
         """Join a room with access control and size limit check."""
-        # Validate room ID
-        error = self.validator.validate_room_id(room_id)
-        if error:
-            custom_log(f"Invalid room ID: {error}")
-            return False
+        try:
+            custom_log(f"Attempting to join room {room_id} for session {session_id}")
             
-        # Check room access
-        if not self.check_room_access(room_id, user_id, user_roles):
-            custom_log(f"Access denied to room {room_id} for user {user_id}")
-            return False
+            # Validate room ID
+            error = self.validator.validate_room_id(room_id)
+            if error:
+                custom_log(f"Invalid room ID: {error}")
+                emit('join_error', {'message': error}, room=session_id)
+                return False
+                
+            # Check room access
+            if not self.check_room_access(room_id, user_id, user_roles):
+                custom_log(f"Access denied to room {room_id} for user {user_id}")
+                emit('join_error', {'message': 'Access denied to room'}, room=session_id)
+                return False
+                
+            # Reset room sizes to ensure accuracy before checking
+            self.reset_room_sizes()
             
-        # Check room size limit
-        if self.check_room_size_limit(room_id):
-            custom_log(f"Room {room_id} has reached its size limit")
-            return False
+            # Check room size limit atomically
+            if not self.redis_manager.check_and_increment_room_size(room_id, self._room_size_limit):
+                custom_log(f"Room {room_id} has reached its size limit of {self._room_size_limit}")
+                emit('room_full', {
+                    'message': f'Room has reached its size limit of {self._room_size_limit} users',
+                    'current_size': self.get_room_size(room_id),
+                    'limit': self._room_size_limit
+                }, room=session_id)
+                return False
+                
+            # Join the room
+            join_room(room_id, sid=session_id)
             
-        # Join the room
-        join_room(room_id, sid=session_id)
-        
-        # Update room tracking
-        if room_id not in self.rooms:
-            self.rooms[room_id] = set()
-        self.rooms[room_id].add(session_id)
-        
-        if session_id not in self.session_rooms:
-            self.session_rooms[session_id] = set()
-        self.session_rooms[session_id].add(room_id)
-        
-        # Update room size in Redis
-        self.update_room_size(room_id, 1)
-        
-        custom_log(f"Session {session_id} joined room {room_id}")
-        return True
+            # Update room tracking
+            if room_id not in self.rooms:
+                self.rooms[room_id] = set()
+            self.rooms[room_id].add(session_id)
+            
+            if session_id not in self.session_rooms:
+                self.session_rooms[session_id] = set()
+            self.session_rooms[session_id].add(room_id)
+            
+            # Update user presence
+            self.update_user_presence(session_id, 'online')
+            
+            # Broadcast presence update to room
+            self.broadcast_to_room(room_id, 'user_joined', {
+                'user_id': user_id,
+                'username': self.get_session_info(session_id).get('username', 'Anonymous')
+            })
+            
+            custom_log(f"Session {session_id} successfully joined room {room_id}")
+            return True
+            
+        except Exception as e:
+            custom_log(f"Error joining room {room_id} for session {session_id}: {str(e)}")
+            emit('join_error', {'message': 'Internal server error'}, room=session_id)
+            return False
 
     def leave_room(self, room_id: str, session_id: str):
         """Leave a room and update room size."""
-        # Leave the room
-        leave_room(room_id, sid=session_id)
-        
-        # Update room tracking
-        if room_id in self.rooms:
-            self.rooms[room_id].discard(session_id)
-            if not self.rooms[room_id]:
-                del self.rooms[room_id]
+        try:
+            custom_log(f"Starting room leave process for session {session_id} from room {room_id}")
+            
+            # Get session info before any cleanup
+            session_info = self.get_session_info(session_id)
+            if not session_info:
+                custom_log(f"No session info found for {session_id} during room leave")
+                return False
                 
-        if session_id in self.session_rooms:
-            self.session_rooms[session_id].discard(room_id)
-            if not self.session_rooms[session_id]:
-                del self.session_rooms[session_id]
-                
-        # Update room size in Redis
-        self.update_room_size(room_id, -1)
-        
-        custom_log(f"Session {session_id} left room {room_id}")
-        return True
+            user_id = session_info.get('user_id')
+            username = session_info.get('username', 'Anonymous')
+            
+            # Update room tracking first
+            if room_id in self.rooms:
+                self.rooms[room_id].discard(session_id)
+                if not self.rooms[room_id]:
+                    del self.rooms[room_id]
+                    
+            if session_id in self.session_rooms:
+                self.session_rooms[session_id].discard(room_id)
+                if not self.session_rooms[session_id]:
+                    del self.session_rooms[session_id]
+                    
+            # Update user presence
+            self.update_user_presence(session_id, 'away')
+            
+            # Broadcast presence update to room
+            self.broadcast_to_room(room_id, 'user_left', {
+                'user_id': user_id,
+                'username': username
+            })
+            
+            # Leave the room last
+            leave_room(room_id, sid=session_id)
+            
+            # Reset room sizes to ensure accuracy
+            self.reset_room_sizes()
+            
+            custom_log(f"Session {session_id} successfully left room {room_id}")
+            return True
+            
+        except Exception as e:
+            custom_log(f"Error during room leave for session {session_id}: {str(e)}")
+            return False
 
     def broadcast_to_room(self, room_id: str, event: str, data: Dict[str, Any]):
         """Broadcast an event to all users in a room."""
@@ -336,19 +533,335 @@ class WebSocketManager:
         """Get all rooms a session is in."""
         return self.session_rooms.get(session_id, set())
 
-    def cleanup_session(self, session_id: str):
-        """Clean up all room memberships for a session."""
-        # Remove from all rooms
-        if session_id in self.session_rooms:
-            for room_id in self.session_rooms[session_id]:
-                if room_id in self.rooms:
-                    self.rooms[room_id].discard(session_id)
-                    # Update room size in Redis
-                    self.update_room_size(room_id, -1)
-            del self.session_rooms[session_id]
+    def reset_room_sizes(self):
+        """Reset all room sizes in Redis to match actual connected users."""
+        try:
+            custom_log("Starting room size reset")
             
-        custom_log(f"Cleaned up session {session_id}")
+            # Log current state
+            custom_log(f"Current rooms state: {self.rooms}")
+            custom_log(f"Current session_rooms state: {self.session_rooms}")
+            
+            # Get all rooms and their sizes
+            room_sizes = {}
+            for room_id in self.rooms:
+                # Get the actual sessions in the room
+                sessions = self.rooms[room_id]
+                custom_log(f"Room {room_id} contains sessions: {sessions}")
+                
+                # Count only valid sessions
+                valid_sessions = set()
+                for session_id in sessions:
+                    session_info = self.get_session_info(session_id)
+                    if session_info:
+                        valid_sessions.add(session_id)
+                    else:
+                        custom_log(f"Found stale session {session_id} in room {room_id}")
+                
+                actual_size = len(valid_sessions)
+                room_sizes[room_id] = actual_size
+                custom_log(f"Room {room_id} has {actual_size} valid connected users")
+            
+            # Reset all room sizes in Redis first
+            for room_id in room_sizes:
+                # Get current size before reset
+                old_size = self.redis_manager.get_room_size(room_id)
+                custom_log(f"Current Redis size for room {room_id}: {old_size}")
+                
+                # Set the new size directly
+                self.redis_manager.set_room_size(room_id, room_sizes[room_id])
+                custom_log(f"Set room {room_id} size to {room_sizes[room_id]}")
+                
+            # Log final sizes for verification
+            for room_id in room_sizes:
+                current_size = self.redis_manager.get_room_size(room_id)
+                custom_log(f"Final size for room {room_id}: {current_size}")
+                
+            # Clean up any stale room data
+            self._cleanup_stale_rooms()
+                
+            custom_log("Completed room size reset")
+            
+        except Exception as e:
+            custom_log(f"Error resetting room sizes: {str(e)}")
+            
+    def _cleanup_stale_rooms(self):
+        """Clean up stale room data and completely remove empty rooms."""
+        try:
+            custom_log("Starting stale room cleanup")
+            
+            # Find rooms with no valid sessions
+            empty_rooms = set()
+            for room_id in list(self.rooms.keys()):  # Use list to avoid modification during iteration
+                valid_sessions = False
+                if room_id in self.rooms:  # Check again as it might have been removed
+                    for session_id in self.rooms[room_id]:
+                        session_info = self.get_session_info(session_id)
+                        if session_info:
+                            valid_sessions = True
+                            break
+                    
+                    if not valid_sessions:
+                        empty_rooms.add(room_id)
+                        custom_log(f"Room {room_id} has no valid sessions")
+            
+            # Clean up empty rooms
+            for room_id in empty_rooms:
+                custom_log(f"Cleaning up empty room: {room_id}")
+                
+                # Remove from rooms tracking
+                if room_id in self.rooms:
+                    del self.rooms[room_id]
+                    custom_log(f"Removed room {room_id} from rooms tracking")
+                
+                # Remove from all session_rooms
+                for session_id in list(self.session_rooms.keys()):
+                    if room_id in self.session_rooms[session_id]:
+                        self.session_rooms[session_id].discard(room_id)
+                        if not self.session_rooms[session_id]:
+                            del self.session_rooms[session_id]
+                            custom_log(f"Removed empty session {session_id} from session_rooms")
+                
+                # Clean up Redis data
+                self._cleanup_room_data(room_id)
+                
+            custom_log(f"Cleaned up {len(empty_rooms)} empty rooms")
+            
+        except Exception as e:
+            custom_log(f"Error during stale room cleanup: {str(e)}")
+            
+    def _cleanup_room_data(self, room_id: str):
+        """Clean up all Redis data related to a room."""
+        try:
+            custom_log(f"Starting complete cleanup for room {room_id}")
+            
+            # Clean up room size
+            self.redis_manager.reset_room_size(room_id)
+            custom_log(f"Reset room size for {room_id}")
+            
+            # Clean up room presence data
+            presence_key = f"ws:room:{room_id}:presence"
+            self.redis_manager.delete(presence_key)
+            custom_log(f"Cleaned up presence data for room {room_id}")
+            
+            # Clean up room messages
+            messages_key = f"ws:room:{room_id}:messages"
+            self.redis_manager.delete(messages_key)
+            custom_log(f"Cleaned up message history for room {room_id}")
+            
+            # Clean up room metadata
+            metadata_key = f"ws:room:{room_id}:metadata"
+            self.redis_manager.delete(metadata_key)
+            custom_log(f"Cleaned up metadata for room {room_id}")
+            
+            # Clean up room rate limits
+            for limit_type in self._rate_limits:
+                rate_key = f"ws:room:{room_id}:{limit_type}"
+                self.redis_manager.delete(rate_key)
+            custom_log(f"Cleaned up rate limit data for room {room_id}")
+            
+            # Clean up any other room-related keys using pattern matching
+            self.redis_manager.cleanup_room_keys(room_id)
+            
+            custom_log(f"Completed cleanup for room {room_id}")
+            
+        except Exception as e:
+            custom_log(f"Error cleaning up room data for {room_id}: {str(e)}")
+
+    def cleanup_session(self, session_id: str):
+        """Clean up all room memberships and Redis data for a session."""
+        try:
+            custom_log(f"Starting cleanup for session {session_id}")
+            
+            # Get session info before cleanup
+            session_info = self.get_session_info(session_id)
+            if not session_info:
+                custom_log(f"No session info found for {session_id} during cleanup")
+                # Even without session info, we should clean up room memberships
+                self._cleanup_room_memberships(session_id)
+                return
+                
+            user_id = session_info.get('user_id')
+            username = session_info.get('username', 'Anonymous')
+            
+            # Clean up room memberships first
+            self._cleanup_room_memberships(session_id, user_id, username)
+            
+            # Update user presence to offline
+            self.update_user_presence(session_id, 'offline')
+            
+            if user_id:
+                # Clean up presence data
+                presence_key = f"ws:presence:{user_id}"
+                self.redis_manager.delete(presence_key)
+                custom_log(f"Cleaned up presence data for user {user_id}")
+                
+                # Clean up rate limit data
+                for limit_type in self._rate_limits:
+                    rate_key = f"ws:{limit_type}:{session_id}"
+                    self.redis_manager.delete(rate_key)
+                custom_log(f"Cleaned up rate limit data for session {session_id}")
+            
+            # Clean up session data last
+            self.cleanup_session_data(session_id)
+            
+            # Clean up any stale room data
+            self._cleanup_stale_rooms()
+            
+            # Clean up room sizes
+            self.redis_manager.cleanup_room_sizes()
+            
+            # Reset room sizes to ensure accuracy
+            self.reset_room_sizes()
+            
+            custom_log(f"Completed cleanup for session {session_id}")
+            
+        except Exception as e:
+            custom_log(f"Error during session cleanup for {session_id}: {str(e)}")
+            
+    def _cleanup_room_memberships(self, session_id: str, user_id: str = None, username: str = None):
+        """Clean up room memberships for a session."""
+        try:
+            custom_log(f"Cleaning up room memberships for session {session_id}")
+            
+            # Get all rooms the session is in
+            rooms_to_leave = self.get_rooms_for_session(session_id)
+            custom_log(f"Session {session_id} is in rooms: {rooms_to_leave}")
+            
+            # Remove from all rooms
+            for room_id in rooms_to_leave:
+                if room_id in self.rooms:
+                    # Update room size in Redis before removing from room
+                    self.update_room_size(room_id, -1)
+                    custom_log(f"Updated room size for {room_id} after user departure")
+                    
+                    # Remove from room tracking
+                    self.rooms[room_id].discard(session_id)
+                    if not self.rooms[room_id]:
+                        del self.rooms[room_id]
+                        custom_log(f"Room {room_id} is now empty")
+                        
+                    # Broadcast user left event if we have user info
+                    if user_id and username:
+                        self.broadcast_to_room(room_id, 'user_left', {
+                            'user_id': user_id,
+                            'username': username
+                        })
+                    custom_log(f"Removed session {session_id} from room {room_id}")
+                    
+            # Clear session's room memberships
+            if session_id in self.session_rooms:
+                del self.session_rooms[session_id]
+                
+            custom_log(f"Completed room membership cleanup for session {session_id}")
+            
+        except Exception as e:
+            custom_log(f"Error cleaning up room memberships for session {session_id}: {str(e)}")
 
     def run(self, app, **kwargs):
         """Run the WebSocket server."""
         self.socketio.run(app, **kwargs)
+
+    def _handle_message(self, sid: str, message: str):
+        """Handle incoming WebSocket message."""
+        try:
+            # Get session info
+            session_info = self.get_session_info(sid)
+            if not session_info:
+                custom_log(f"No session info found for {sid}")
+                return
+                
+            # Validate message rate
+            error = self.validator.validate_message_rate(sid)
+            if error:
+                custom_log(f"Rate limit exceeded for session {sid}: {error}")
+                emit('error', {'message': error}, room=sid)
+                return
+                
+            # Validate message size and content
+            error = self.validator.validate_text_message_size(message)
+            if error:
+                custom_log(f"Message size validation failed for session {sid}: {error}")
+                emit('error', {'message': error}, room=sid)
+                return
+                
+            # Check if message should be compressed
+            if self.validator.should_compress_message(message):
+                message = self.validator.compress_message(message)
+                
+            # Process message
+            try:
+                data = json.loads(message)
+                event = data.get('event')
+                payload = data.get('payload')
+                
+                # Validate event
+                error = self.validator.validate_event(event)
+                if error:
+                    custom_log(f"Event validation failed for session {sid}: {error}")
+                    emit('error', {'message': error}, room=sid)
+                    return
+                    
+                # Validate payload
+                error = self.validator.validate_payload(payload)
+                if error:
+                    custom_log(f"Payload validation failed for session {sid}: {error}")
+                    emit('error', {'message': error}, room=sid)
+                    return
+                    
+                # Handle specific events
+                if event == 'join_room':
+                    room_id = payload.get('room_id')
+                    if room_id:
+                        self.join_room(room_id, sid, session_info.get('user_id'), session_info.get('user_roles'))
+                elif event == 'leave_room':
+                    room_id = payload.get('room_id')
+                    if room_id:
+                        self.leave_room(room_id, sid)
+                elif event == 'message':
+                    room_id = payload.get('room_id')
+                    message_content = payload.get('message')
+                    if room_id and message_content:
+                        self.broadcast_message(room_id, message_content, sid)
+                        
+            except json.JSONDecodeError:
+                # Handle non-JSON messages
+                custom_log(f"Received non-JSON message from session {sid}")
+                # Process as raw message if needed
+                
+        except Exception as e:
+            custom_log(f"Error handling message from session {sid}: {str(e)}")
+            emit('error', {'message': 'Internal server error'}, room=sid)
+
+    def broadcast_message(self, room_id: str, message: str, sender_id: str = None):
+        """Broadcast a message to all users in a room."""
+        try:
+            # Validate message size
+            error = self.validator.validate_text_message_size(message)
+            if error:
+                custom_log(f"Message size validation failed: {error}")
+                emit('error', {'message': error}, room=sender_id)
+                return
+                
+            # Check if message should be compressed
+            if self.validator.should_compress_message(message):
+                message = self.validator.compress_message(message)
+                
+            # Get sender info
+            sender_info = self.get_session_info(sender_id) if sender_id else None
+            sender_name = sender_info.get('username') if sender_info else 'Anonymous'
+            
+            # Prepare message data
+            message_data = {
+                'message': message,
+                'sender': sender_name,
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            
+            # Broadcast to room
+            emit('message', message_data, room=room_id)
+            
+        except Exception as e:
+            custom_log(f"Error broadcasting message to room {room_id}: {str(e)}")
+            if sender_id:
+                emit('error', {'message': 'Failed to broadcast message'}, room=sender_id)
