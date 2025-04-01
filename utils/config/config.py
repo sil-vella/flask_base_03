@@ -68,6 +68,14 @@ class Config:
     REDIS_CACHE_TTL = int(os.getenv("REDIS_CACHE_TTL", "300"))  # 5 minutes in seconds
 
     # WebSocket Configuration
+    WS_MAX_MESSAGE_SIZE = 1024 * 1024  # 1MB default max message size
+    WS_MAX_TEXT_MESSAGE_SIZE = 1024 * 1024  # 1MB for text messages
+    WS_MAX_BINARY_MESSAGE_SIZE = 5 * 1024 * 1024  # 5MB for binary messages
+    WS_MAX_JSON_MESSAGE_SIZE = 512 * 1024  # 512KB for JSON messages
+    WS_MESSAGE_RATE_LIMIT = 100  # messages per second per user
+    WS_MESSAGE_RATE_WINDOW = 1  # seconds for rate limiting
+    WS_COMPRESSION_THRESHOLD = 1024  # 1KB - compress messages larger than this
+    WS_COMPRESSION_LEVEL = 6  # zlib compression level (1-9)
     WS_MAX_PAYLOAD_SIZE = 1024 * 1024  # 1MB max payload size
     WS_PING_TIMEOUT = 60
     WS_PING_INTERVAL = 25
@@ -78,6 +86,17 @@ class Config:
     WS_ROOM_SIZE_LIMIT = 2
     WS_ROOM_SIZE_CHECK_INTERVAL = 300  # 5 minutes
     WS_ALLOWED_ORIGINS = ['http://localhost:5000', 'http://localhost:3000']
+
+    # Presence Tracking Configuration
+    WS_PRESENCE_CHECK_INTERVAL = 30  # seconds between presence checks
+    WS_PRESENCE_TIMEOUT = 90  # seconds before marking user as offline
+    WS_PRESENCE_CLEANUP_INTERVAL = 300  # seconds between cleanup operations
+    WS_PRESENCE_STATUSES = {
+        'online': 'online',
+        'away': 'away',
+        'offline': 'offline',
+        'busy': 'busy'
+    }
 
     # Message Size Limits
     WS_MAX_MESSAGE_LENGTH = 1000  # Maximum length for text messages

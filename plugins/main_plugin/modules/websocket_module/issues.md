@@ -88,6 +88,21 @@
   - Added automatic cleanup of empty rooms
   - Added room size monitoring and logging
 
+### 2. Message Size Limits
+- **Priority**: Medium
+- **Status**: Implemented
+- **Description**: Implement comprehensive message size limits and validation
+- **Implementation Details**:
+  - Added different size limits for different message types:
+    - Text messages: 1MB
+    - Binary messages: 5MB
+    - JSON messages: 512KB
+  - Added message rate limiting (100 messages per second per user)
+  - Added message compression for large messages (>1KB)
+  - Added validation for message content and format
+  - Added error handling and client notifications
+  - Added logging for size limit violations
+
 ## Low Priority Issues
 
 ### 9. Logging ✅
@@ -132,12 +147,12 @@
 
 ### Pending Changes
 1. ❌ Add more granular rate limiting per room
-2. ❌ Add user presence tracking
+2. ✅ Add user presence tracking
 3. ❌ Implement message persistence
 
 ### Dependencies
 - Flask-SocketIO
-- Redis for rate limiting and session storage
+- Redis for rate limiting, session storage, and presence tracking
 - JWT for authentication
 - Custom logging system
 
@@ -150,9 +165,35 @@
 6. Session security tests
 7. Error handling tests
 8. Performance testing with limits
+9. Presence tracking tests:
+   - User online/offline status
+   - Room presence updates
+   - Presence timeout handling
+   - Presence cleanup
+   - Presence broadcast events
 
 ## Timeline
 - Critical Issues: Room Access Control - Next sprint
 - High Priority: Input Validation - Next sprint
 - Medium Priority: Room Size Limits - Following sprint
-- Low Priority: Enhanced Message Size Validation - Future enhancement 
+- Low Priority: Enhanced Message Size Validation - Future enhancement
+
+### Implementation Notes
+
+#### User Presence Tracking
+- **Status**: Implemented
+- **Features**:
+  - Real-time user presence status (online/away/offline)
+  - Room-based presence tracking
+  - Presence timeout handling
+  - Presence cleanup for stale records
+  - Presence broadcast events
+  - Redis-based presence storage
+- **Events**:
+  - `presence_update`: User status change
+  - `user_joined`: User joins a room
+  - `user_left`: User leaves a room
+- **Configuration**:
+  - Presence check interval: 30 seconds
+  - Presence timeout: 90 seconds
+  - Cleanup interval: 300 seconds 

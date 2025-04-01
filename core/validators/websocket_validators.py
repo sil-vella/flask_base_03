@@ -1,9 +1,11 @@
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional, Set, Union
 from tools.logger.custom_logging import custom_log
 import re
 from datetime import datetime
 import json
 from utils.config.config import Config
+import time
+import zlib
 
 class WebSocketValidator:
     """Validates WebSocket inputs and sanitizes data."""
@@ -220,4 +222,84 @@ class WebSocketValidator:
         if 'email' in sanitized:
             sanitized['email'] = sanitized['email'].lower().strip()
             
-        return sanitized 
+        return sanitized
+
+    def validate_message_size(self, message: str) -> Optional[str]:
+        """Validate message size."""
+        if not message:
+            return "Message cannot be empty"
+            
+        if len(message) > Config.WS_MAX_MESSAGE_SIZE:
+            return f"Message exceeds maximum size of {Config.WS_MAX_MESSAGE_SIZE} bytes"
+            
+        return None
+
+    def validate_text_message_size(self, message: str) -> Optional[str]:
+        """Validate text message size."""
+        if not message:
+            return "Message cannot be empty"
+            
+        if len(message) > Config.WS_MAX_TEXT_MESSAGE_SIZE:
+            return f"Text message exceeds maximum size of {Config.WS_MAX_TEXT_MESSAGE_SIZE} bytes"
+            
+        return None
+
+    def validate_binary_message_size(self, message: bytes) -> Optional[str]:
+        """Validate binary message size."""
+        if not message:
+            return "Message cannot be empty"
+            
+        if len(message) > Config.WS_MAX_BINARY_MESSAGE_SIZE:
+            return f"Binary message exceeds maximum size of {Config.WS_MAX_BINARY_MESSAGE_SIZE} bytes"
+            
+        return None
+
+    def validate_json_message_size(self, message: str) -> Optional[str]:
+        """Validate JSON message size."""
+        if not message:
+            return "Message cannot be empty"
+            
+        if len(message) > Config.WS_MAX_JSON_MESSAGE_SIZE:
+            return f"JSON message exceeds maximum size of {Config.WS_MAX_JSON_MESSAGE_SIZE} bytes"
+            
+        try:
+            json.loads(message)
+            return None
+        except json.JSONDecodeError:
+            return "Invalid JSON format"
+
+    def validate_message_rate(self, session_id: str) -> Optional[str]:
+        """Validate message rate limit."""
+        current_time = time.time()
+        
+        # Get message timestamps for this session
+        timestamps = self.message_timestamps.get(session_id, [])
+        
+        # Remove timestamps outside the rate window
+        timestamps = [ts for ts in timestamps if current_time - ts < Config.WS_MESSAGE_RATE_WINDOW]
+        
+        # Check if rate limit exceeded
+        if len(timestamps) >= Config.WS_MESSAGE_RATE_LIMIT:
+            return f"Message rate limit of {Config.WS_MESSAGE_RATE_LIMIT} messages per {Config.WS_MESSAGE_RATE_WINDOW} seconds exceeded"
+            
+        # Update timestamps
+        timestamps.append(current_time)
+        self.message_timestamps[session_id] = timestamps
+        
+        return None
+
+    def should_compress_message(self, message: Union[str, bytes]) -> bool:
+        """Check if message should be compressed."""
+        size = len(message)
+        return size > Config.WS_COMPRESSION_THRESHOLD
+
+    def compress_message(self, message: Union[str, bytes]) -> bytes:
+        """Compress a message using zlib."""
+        if isinstance(message, str):
+            message = message.encode('utf-8')
+            
+        return zlib.compress(message, level=Config.WS_COMPRESSION_LEVEL)
+
+    def decompress_message(self, compressed_message: bytes) -> bytes:
+        """Decompress a message using zlib."""
+        return zlib.decompress(compressed_message) 
