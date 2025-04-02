@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Game Plugin Test</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        .panel {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .log-panel {
+            height: 400px;
+            overflow-y: auto;
+            background: #1e1e1e;
+            color: #fff;
+            padding: 10px;
+            font-family: monospace;
+            border-radius: 4px;
+        }
+        .game-board {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin: 20px 0;
+        }
+        .cell {
+            aspect-ratio: 1;
+            background: #eee;
+            border: 1px solid #ccc;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .cell:hover {
+            background: #ddd;
+        }
+        .cell.selected {
+            background: #e3f2fd;
+        }
+        .player-list {
+            list-style: none;
+            padding: 0;
+        }
+        .player-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px;
+            border-bottom: 1px solid #eee;
+        }
+        .player-item:last-child {
+            border-bottom: none;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            background: #e3f2fd;
+        }
+        .error {
+            background: #ffebee;
+            color: #c62828;
+        }
+        .success {
+            background: #e8f5e9;
+            color: #2e7d32;
+        }
+        button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            background: #2196f3;
+            color: white;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background: #1976d2;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        input {
+            padding: 8px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            margin: 5px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>Game Plugin Test</h1>
+    
+    <div class="container">
+        <div class="panel">
+            <h2>Connection Setup</h2>
+            <div>
+                <input type="text" id="jwtToken" placeholder="JWT Token" style="width: 100%;">
+                <button onclick="connect()">Connect</button>
+                <button onclick="disconnect()" id="disconnectBtn" disabled>Disconnect</button>
+            </div>
+            
+            <h2>Game Session</h2>
+            <div>
+                <input type="text" id="sessionId" placeholder="Session ID" style="width: 100%;">
+                <button onclick="joinGame()" id="joinBtn" disabled>Join Game</button>
+                <button onclick="leaveGame()" id="leaveBtn" disabled>Leave Game</button>
+            </div>
+            
+            <h2>Game Board</h2>
+            <div class="game-board" id="gameBoard">
+                <!-- Cells will be generated dynamically -->
+            </div>
+            
+            <h2>Game Actions</h2>
+            <div>
+                <button onclick="makeMove()" id="moveBtn" disabled>Make Move</button>
+                <button onclick="submitAnswer()" id="answerBtn" disabled>Submit Answer</button>
+                <button onclick="skipTurn()" id="skipBtn" disabled>Skip Turn</button>
+                <button onclick="endTurn()" id="endTurnBtn" disabled>End Turn</button>
+            </div>
+            
+            <h2>Players</h2>
+            <ul class="player-list" id="playerList">
+                <!-- Players will be listed here -->
+            </ul>
+        </div>
+        
+        <div class="panel">
+            <h2>Status</h2>
+            <div id="status" class="status">Not connected</div>
+            
+            <h2>Event Log</h2>
+            <div class="log-panel" id="eventLog"></div>
+        </div>
+    </div>
+
+    <script>
+        let socket = null;
+        let currentSession = null;
+        let selectedCell = null;
+        let gameState = null;
+
+        // Initialize game board
+        function initGameBoard() {
+            const board = document.getElementById('gameBoard');
+            board.innerHTML = '';
+            for (let i = 0; i < 9; i++) {
+                const cell = document.createElement('div');
+                cell.className = 'cell';
+                cell.textContent = '';
+                cell.onclick = () => selectCell(i);
+                board.appendChild(cell);
+            }
+        }
+
+        // Select a cell on the game board
+        function selectCell(index) {
+            if (!gameState || gameState.currentPlayer !== socket.id) return;
+            
+            const cells = document.querySelectorAll('.cell');
+            cells.forEach(cell => cell.classList.remove('selected'));
+            cells[index].classList.add('selected');
+            selectedCell = index;
+        }
+
+        // Connect to WebSocket server
+        function connect() {
+            const token = document.getElementById('jwtToken').value;
+            if (!token) {
+                log('Error: JWT token is required');
+                return;
+            }
+
+            socket = io('http://localhost:5000', {
+                auth: { token }
+            });
+
+            socket.on('connect', () => {
+                log('Connected to server');
+                updateStatus('Connected', 'success');
+                document.getElementById('disconnectBtn').disabled = false;
+                document.getElementById('joinBtn').disabled = false;
+            });
+
+            socket.on('disconnect', () => {
+                log('Disconnected from server');
+                updateStatus('Disconnected', 'error');
+                document.getElementById('disconnectBtn').disabled = true;
+                document.getElementById('joinBtn').disabled = true;
+            });
+
+            socket.on('game_joined', (data) => {
+                log('Game joined:', data);
+                currentSession = data.session_id;
+                gameState = data.game_state;
+                updateGameState();
+                document.getElementById('leaveBtn').disabled = false;
+                updateStatus('Game joined', 'success');
+            });
+
+            socket.on('player_joined_game', (data) => {
+                log('Player joined:', data);
+                updatePlayerList();
+            });
+
+            socket.on('player_left_game', (data) => {
+                log('Player left:', data);
+                updatePlayerList();
+            });
+
+            socket.on('game_action', (data) => {
+                log('Game action:', data);
+                updateGameState();
+            });
+
+            socket.on('error', (data) => {
+                log('Error:', data);
+                updateStatus(data.message, 'error');
+            });
+        }
+
+        // Disconnect from WebSocket server
+        function disconnect() {
+            if (socket) {
+                socket.disconnect();
+                socket = null;
+                currentSession = null;
+                gameState = null;
+                document.getElementById('disconnectBtn').disabled = true;
+                document.getElementById('joinBtn').disabled = true;
+                document.getElementById('leaveBtn').disabled = true;
+                updateStatus('Disconnected', 'error');
+            }
+        }
+
+        // Join a game session
+        function joinGame() {
+            const sessionId = document.getElementById('sessionId').value;
+            if (!sessionId) {
+                log('Error: Session ID is required');
+                return;
+            }
+
+            socket.emit('join_game', {
+                session_id: sessionId
+            });
+        }
+
+        // Leave the current game session
+        function leaveGame() {
+            if (!currentSession) return;
+
+            socket.emit('leave_game', {
+                session_id: currentSession
+            });
+            
+            currentSession = null;
+            gameState = null;
+            document.getElementById('leaveBtn').disabled = true;
+            updateStatus('Left game', 'success');
+        }
+
+        // Make a move on the game board
+        function makeMove() {
+            if (!gameState || selectedCell === null) return;
+
+            socket.emit('game_action', {
+                session_id: currentSession,
+                action: {
+                    type: 'move',
+                    data: {
+                        position: selectedCell
+                    }
+                }
+            });
+        }
+
+        // Submit an answer
+        function submitAnswer() {
+            if (!gameState) return;
+
+            socket.emit('game_action', {
+                session_id: currentSession,
+                action: {
+                    type: 'answer',
+                    data: {
+                        answer: 'Sample answer'
+                    }
+                }
+            });
+        }
+
+        // Skip the current turn
+        function skipTurn() {
+            if (!gameState) return;
+
+            socket.emit('game_action', {
+                session_id: currentSession,
+                action: {
+                    type: 'skip'
+                }
+            });
+        }
+
+        // End the current turn
+        function endTurn() {
+            if (!gameState) return;
+
+            socket.emit('game_action', {
+                session_id: currentSession,
+                action: {
+                    type: 'end_turn'
+                }
+            });
+        }
+
+        // Update the game state display
+        function updateGameState() {
+            if (!gameState) return;
+
+            const cells = document.querySelectorAll('.cell');
+            if (gameState.board_data && gameState.board_data.cells) {
+                gameState.board_data.cells.forEach((cell, index) => {
+                    cells[index].textContent = cell || '';
+                });
+            }
+
+            // Update action buttons based on current player
+            const isCurrentPlayer = gameState.current_player === socket.id;
+            document.getElementById('moveBtn').disabled = !isCurrentPlayer;
+            document.getElementById('answerBtn').disabled = !isCurrentPlayer;
+            document.getElementById('skipBtn').disabled = !isCurrentPlayer;
+            document.getElementById('endTurnBtn').disabled = !isCurrentPlayer;
+        }
+
+        // Update the player list
+        function updatePlayerList() {
+            if (!gameState || !gameState.players) return;
+
+            const playerList = document.getElementById('playerList');
+            playerList.innerHTML = '';
+
+            Object.entries(gameState.players).forEach(([id, player]) => {
+                const li = document.createElement('li');
+                li.className = 'player-item';
+                li.innerHTML = `
+                    <span>${player.username}</span>
+                    <span>Score: ${player.score}</span>
+                `;
+                playerList.appendChild(li);
+            });
+        }
+
+        // Update the status display
+        function updateStatus(message, type) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = `status ${type}`;
+        }
+
+        // Log messages to the event log
+        function log(...args) {
+            const logPanel = document.getElementById('eventLog');
+            const message = args.map(arg => 
+                typeof arg === 'object' ? JSON.stringify(arg, null, 2) : arg
+            ).join(' ');
+            
+            const entry = document.createElement('div');
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logPanel.appendChild(entry);
+            logPanel.scrollTop = logPanel.scrollHeight;
+        }
+
+        // Initialize the page
+        initGameBoard();
+    </script>
+</body>
+</html> 
