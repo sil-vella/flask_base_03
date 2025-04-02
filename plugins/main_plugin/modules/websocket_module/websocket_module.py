@@ -105,6 +105,16 @@ class WebSocketModule:
         self.websocket_manager.register_authenticated_handler('button_press', self._handle_button_press)
         self.websocket_manager.register_authenticated_handler('get_counter', self._handle_get_counter)
         self.websocket_manager.register_authenticated_handler('get_users', self._handle_get_users)
+        
+        # Register game event handlers if game plugin is available
+        if self.app_manager and self.app_manager.module_manager:
+            game_event_handlers = self.app_manager.module_manager.get_module("game_event_handlers")
+            if game_event_handlers:
+                self.websocket_manager.register_authenticated_handler('join_game', game_event_handlers.handle_join_game)
+                self.websocket_manager.register_authenticated_handler('leave_game', game_event_handlers.handle_leave_game)
+                self.websocket_manager.register_authenticated_handler('game_action', game_event_handlers.handle_game_action)
+                custom_log("Game event handlers registered")
+        
         custom_log("WebSocket event handlers registered")
 
     def _validate_token(self, token: str) -> Optional[Dict[str, Any]]:
@@ -170,23 +180,7 @@ class WebSocketModule:
         }
         self.websocket_manager.store_session_data(session_id, session_data)
         
-        # Join button counter room with user ID and roles
-        if not self.websocket_manager.join_room(
-            self.button_counter_room, 
-            session_id,
-            user_id=str(user_data['id']),  # Convert to string for consistency
-            user_roles=set(user_data.get('roles', []))  # Get roles from user data
-        ):
-            custom_log(f"Failed to join room {self.button_counter_room} for user {user_data['id']}")
-            return {'status': 'error', 'message': 'Failed to join room'}
-        
-        # Broadcast user joined event
-        self.websocket_manager.broadcast_to_room(
-            self.button_counter_room,
-            'user_joined',
-            {'username': user_data['username']}
-        )
-        
+        # Don't automatically join any room
         custom_log(f"New WebSocket connection: {session_id} from {origin} for user {user_data['id']}")
         return {'status': 'connected', 'session_id': session_id}
 

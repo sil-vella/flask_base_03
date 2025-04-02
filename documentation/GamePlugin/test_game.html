@@ -357,14 +357,14 @@
 
             socket = io('http://localhost:5000', {
                 query: {
-                    token: accessToken,
-                    room_id: 'game_room'
+                    token: accessToken
                 },
                 reconnection: true,
                 reconnectionAttempts: maxRetries,
                 reconnectionDelay: retryDelay,
                 auth: {
-                    token: accessToken
+                    token: accessToken,
+                    username: document.getElementById('username').value || 'Anonymous'
                 },
                 transports: ['websocket']  // Force WebSocket transport
             });
@@ -404,9 +404,27 @@
             });
 
             socket.on('game_joined', (data) => {
+                if (!data) {
+                    log('Error: Invalid response from server', true);
+                    updateStatus('Join failed', 'error');
+                    return;
+                }
+
+                if (data.error) {
+                    log('Error joining game: ' + data.error, true);
+                    updateStatus('Join failed', 'error');
+                    return;
+                }
+
                 log('Game joined:', data);
                 currentSession = data.session_id;
                 gameState = data.game_state;
+                
+                // Update UI with player info
+                if (data.player) {
+                    log('Joined as: ' + data.player.username);
+                }
+                
                 updateGameState();
                 document.getElementById('leaveBtn').disabled = false;
                 updateStatus('Game joined', 'success');
@@ -428,8 +446,23 @@
             });
 
             socket.on('error', (error) => {
-                log('Socket error: ' + error.message, true);
+                log('Socket error: ' + (error.message || 'Unknown error'), true);
                 updateStatus('Error', 'error');
+                
+                // Handle specific error cases
+                if (error.message.includes('Game session not found')) {
+                    log('The game session does not exist', true);
+                } else if (error.message.includes('User session not found')) {
+                    log('Please log in again', true);
+                    // Reset UI to login state
+                    document.getElementById('loginSection').classList.add('active');
+                    document.getElementById('userInfo').style.display = 'none';
+                    document.getElementById('gameSection').classList.remove('active');
+                } else if (error.message.includes('Game session has ended')) {
+                    log('This game session has already ended', true);
+                } else if (error.message.includes('Game session was cancelled')) {
+                    log('This game session was cancelled', true);
+                }
             });
         }
 
@@ -447,14 +480,57 @@
             }
         }
 
+        // Create a new game session
+        async function createGameSession() {
+            try {
+                const response = await fetch('http://localhost:5000/api/game/create_session', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Accept': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        game_id: 'test_game',
+                        settings: {
+                            max_players: 2,
+                            round_timeout: 30
+                        }
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                log('Game session created:', data);
+                return data.session_id;
+            } catch (error) {
+                log('Failed to create game session: ' + error.message, true);
+                return null;
+            }
+        }
+
         // Join a game session
-        function joinGame() {
-            const sessionId = document.getElementById('sessionId').value;
+        async function joinGame() {
+            let sessionId = document.getElementById('sessionId').value;
+            
+            // If no session ID provided, create a new session
             if (!sessionId) {
-                log('Error: Session ID is required');
-                return;
+                sessionId = await createGameSession();
+                if (!sessionId) {
+                    log('Error: Failed to create game session');
+                    return;
+                }
+                document.getElementById('sessionId').value = sessionId;
             }
 
+            // Send join game event with just the session ID
             socket.emit('join_game', {
                 session_id: sessionId
             });
@@ -464,6 +540,12 @@
         function leaveGame() {
             if (!currentSession) return;
 
+            // Leave the game room first
+            socket.emit('leave_room', {
+                room_id: 'game_' + currentSession
+            });
+
+            // Then leave the game
             socket.emit('leave_game', {
                 session_id: currentSession
             });
