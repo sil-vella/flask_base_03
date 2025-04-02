@@ -199,7 +199,7 @@
         let refreshToken = null;
         let isConnected = false;
         let retryCount = 0;
-        const maxRetries = 5;
+        const maxRetries = 3;
         const retryDelay = 2000; // 2 seconds
 
         // Initialize game board
@@ -263,12 +263,10 @@
 
                 // Update UI
                 document.getElementById('username').textContent = data.user?.username || email;
+                document.getElementById('jwtToken').value = accessToken;
                 document.getElementById('loginSection').classList.remove('active');
                 document.getElementById('userInfo').style.display = 'block';
                 document.getElementById('gameSection').classList.add('active');
-                
-                // Connect to WebSocket only after successful login and token validation
-                connect();
                 
                 log('Login successful');
             } catch (error) {
@@ -319,6 +317,7 @@
                 document.getElementById('loginSection').classList.add('active');
                 document.getElementById('userInfo').style.display = 'none';
                 document.getElementById('gameSection').classList.remove('active');
+                document.getElementById('jwtToken').value = '';
                 
                 log('Logged out successfully');
             } catch (error) {
@@ -337,12 +336,24 @@
                 return;
             }
 
+            // Prevent rapid reconnection attempts
+            if (socket && socket.connected) {
+                log('Already connected to server', true);
+                return;
+            }
+
+            // Prevent connection if we're in the process of connecting
+            if (socket && socket.connecting) {
+                log('Connection already in progress', true);
+                return;
+            }
+
+            log('Attempting to connect to WebSocket server...');
+
             // Disconnect existing socket if any
             if (socket) {
                 socket.disconnect();
             }
-
-            log('Attempting to connect to WebSocket server...');
 
             socket = io('http://localhost:5000', {
                 query: {
@@ -354,7 +365,8 @@
                 reconnectionDelay: retryDelay,
                 auth: {
                     token: accessToken
-                }
+                },
+                transports: ['websocket']  // Force WebSocket transport
             });
 
             socket.on('connect', () => {
@@ -367,47 +379,27 @@
             });
 
             socket.on('connect_error', (error) => {
-                isConnected = false;
-                document.getElementById('status').textContent = 'Connection Error';
-                document.getElementById('status').className = 'status error';
                 log('Connection error: ' + error.message, true);
-
-                // Handle authentication errors
-                if (error.message.includes('Authentication required') || 
-                    error.message.includes('Invalid authentication')) {
-                    log('Authentication error: Please log in again', true);
-                    // Reset UI to login state
-                    document.getElementById('loginSection').classList.add('active');
-                    document.getElementById('userInfo').style.display = 'none';
-                    document.getElementById('gameSection').classList.remove('active');
-                    // Clear tokens
-                    accessToken = null;
-                    refreshToken = null;
-                }
+                updateStatus('Connection failed', 'error');
+                document.getElementById('disconnectBtn').disabled = true;
+                document.getElementById('joinBtn').disabled = true;
             });
 
-            socket.on('disconnect', () => {
+            socket.on('disconnect', (reason) => {
                 isConnected = false;
-                document.getElementById('status').textContent = 'Disconnected';
-                document.getElementById('status').className = 'status error';
-                log('Disconnected from server');
+                log('Disconnected from server. Reason: ' + reason);
+                updateStatus('Disconnected', 'error');
                 document.getElementById('disconnectBtn').disabled = true;
                 document.getElementById('joinBtn').disabled = true;
 
-                // Only retry if we still have a token
-                if (accessToken && retryCount < maxRetries) {
-                    retryCount++;
-                    log(`Retrying connection (${retryCount}/${maxRetries})...`);
-                    setTimeout(connect, retryDelay);
-                } else {
-                    log('Connection failed. Please log in again.', true);
-                    // Reset UI to login state
-                    document.getElementById('loginSection').classList.add('active');
-                    document.getElementById('userInfo').style.display = 'none';
-                    document.getElementById('gameSection').classList.remove('active');
-                    // Clear tokens
-                    accessToken = null;
-                    refreshToken = null;
+                // Handle specific disconnect reasons
+                if (reason === 'io server disconnect') {
+                    // Server initiated disconnect, don't attempt to reconnect
+                    log('Server initiated disconnect - manual reconnection required');
+                } else if (reason === 'transport close') {
+                    log('Connection lost - will attempt to reconnect');
+                } else if (reason === 'ping timeout') {
+                    log('Connection timed out - will attempt to reconnect');
                 }
             });
 
@@ -435,9 +427,9 @@
                 updateGameState();
             });
 
-            socket.on('error', (data) => {
-                log('Error:', data);
-                updateStatus(data.message, 'error');
+            socket.on('error', (error) => {
+                log('Socket error: ' + error.message, true);
+                updateStatus('Error', 'error');
             });
         }
 
