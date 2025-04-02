@@ -100,53 +100,78 @@ class WebSocketManager:
 
     def initialize(self, app):
         """Initialize WebSocket support with the Flask app."""
-        self.socketio.init_app(app)
-        
-        # Register connection handlers
-        @self.socketio.on('connect')
-        def handle_connect():
-            try:
-                session_id = request.sid
-                custom_log(f"New WebSocket connection: {session_id}")
-                
-                # Get session data
-                session_data = self.get_session_data(session_id)
-                if not session_data:
-                    custom_log(f"No session data found for {session_id}")
-                    return False
+        try:
+            self.socketio.init_app(app, cors_allowed_origins="*")
+            
+            @self.socketio.on('connect')
+            def handle_connect():
+                try:
+                    custom_log("New WebSocket connection attempt")
+                    session_id = request.sid
                     
-                # Update session activity
-                self.update_session_activity(session_id)
-                
-                # Update user presence
-                self.update_user_presence(session_id, 'online')
-                
-                # Reset room sizes to ensure accuracy
-                self.reset_room_sizes()
-                
-                return True
-            except Exception as e:
-                custom_log(f"Error handling WebSocket connection: {str(e)}")
-                return False
-                
-        @self.socketio.on('disconnect')
-        def handle_disconnect():
-            try:
-                session_id = request.sid
-                custom_log(f"WebSocket disconnected: {session_id}")
-                
-                # Clean up session
-                self.cleanup_session(session_id)
-                
-                # Reset room sizes to ensure accuracy
-                self.reset_room_sizes()
-                
-                return True
-            except Exception as e:
-                custom_log(f"Error handling WebSocket disconnection: {str(e)}")
-                return False
-                
-        custom_log("WebSocket support initialized with Flask app")
+                    # Get token from request
+                    token = request.args.get('token')
+                    if not token:
+                        custom_log("No token provided for WebSocket connection")
+                        return False
+                        
+                    # Validate token with JWT manager
+                    if not self._jwt_manager:
+                        custom_log("JWT manager not initialized")
+                        return False
+                        
+                    # Verify token and get payload
+                    payload = self._jwt_manager.verify_token(token)
+                    if not payload:
+                        custom_log("Invalid token for WebSocket connection")
+                        return False
+                        
+                    # Check token type
+                    if payload.get('type') != 'websocket':
+                        custom_log("Invalid token type for WebSocket connection")
+                        return False
+                        
+                    # Check client fingerprint
+                    client_fingerprint = self._jwt_manager._get_client_fingerprint()
+                    if client_fingerprint and client_fingerprint != payload.get('fingerprint'):
+                        custom_log("Token fingerprint mismatch")
+                        return False
+                        
+                    # Store session data
+                    session_data = {
+                        'user_id': payload.get('id'),
+                        'username': payload.get('username'),
+                        'token': token,
+                        'connected_at': datetime.utcnow().isoformat()
+                    }
+                    self.store_session_data(session_id, session_data)
+                    
+                    # Update session activity
+                    self.update_session_activity(session_id)
+                    
+                    # Mark user as online
+                    if session_data.get('user_id'):
+                        self.update_user_presence(session_data['user_id'], 'online')
+                    
+                    custom_log(f"WebSocket connection established for session {session_id}")
+                    return True
+                    
+                except Exception as e:
+                    custom_log(f"Error in connect handler: {str(e)}")
+                    return False
+
+            @self.socketio.on('disconnect')
+            def handle_disconnect():
+                try:
+                    session_id = request.sid
+                    custom_log(f"WebSocket disconnection for session {session_id}")
+                    self.cleanup_session(session_id)
+                except Exception as e:
+                    custom_log(f"Error in disconnect handler: {str(e)}")
+
+            custom_log("WebSocket support initialized with Flask app")
+        except Exception as e:
+            custom_log(f"Error initializing WebSocket support: {str(e)}")
 
     def set_jwt_manager(self, jwt_manager):
         """Set the JWT manager instance."""
@@ -158,11 +183,20 @@ class WebSocketManager:
         self._room_access_check = access_check_func
         custom_log("Room access check function set")
 
-    def check_room_access(self, room_id: str, user_id: str, user_roles: Set[str]) -> bool:
+    def check_room_access(self, room_id: str, session_data: Dict[str, Any]) -> bool:
         """Check if a user has access to a room using the module's access check function."""
         if not self._room_access_check:
             custom_log("No room access check function set")
             return False
+            
+        # Extract user_id and roles from session data
+        user_id = session_data.get('user_id')
+        user_roles = session_data.get('user_roles', set())
+        
+        if not user_id:
+            custom_log("No user_id found in session data")
+            return False
+            
         return self._room_access_check(room_id, user_id, user_roles)
 
     def requires_auth(self, handler: Callable) -> Callable:
@@ -386,41 +420,64 @@ class WebSocketManager:
         except Exception as e:
             custom_log(f"Error cleaning up stale presence: {str(e)}")
 
-    def join_room(self, room_id: str, session_id: str, user_id: str = None, user_roles: Set[str] = None):
-        """Join a room with access control and size limit check."""
+    def join_room(self, room_id: str, session_id: str, user_id: Optional[str] = None, user_roles: Optional[Set[str]] = None) -> bool:
+        """Join a room with proper validation and room size tracking."""
         try:
-            custom_log(f"Attempting to join room {room_id} for session {session_id}")
-            
             # Validate room ID
-            error = self.validator.validate_room_id(room_id)
-            if error:
-                custom_log(f"Invalid room ID: {error}")
-                emit('join_error', {'message': error}, room=session_id)
+            if not room_id:
+                custom_log("Invalid room ID")
+                self.socketio.emit('error', {'message': 'Invalid room ID'}, room=session_id)
                 return False
+                
+            # Get session data
+            session_data = self.get_session_data(session_id)
+            if not session_data:
+                custom_log(f"No session data found for {session_id}")
+                self.socketio.emit('error', {'message': 'Session not found'}, room=session_id)
+                return False
+                
+            # Update session data with user_id and roles if provided
+            if user_id:
+                session_data['user_id'] = user_id
+            if user_roles:
+                session_data['user_roles'] = list(user_roles)  # Convert set to list for JSON serialization
                 
             # Check room access
-            if not self.check_room_access(room_id, user_id, user_roles):
-                custom_log(f"Access denied to room {room_id} for user {user_id}")
-                emit('join_error', {'message': 'Access denied to room'}, room=session_id)
+            if not self.check_room_access(room_id, session_data):
+                custom_log(f"Access denied to room {room_id} for session {session_id}")
+                self.socketio.emit('error', {'message': 'Access denied to room'}, room=session_id)
                 return False
                 
-            # Reset room sizes to ensure accuracy before checking
-            self.reset_room_sizes()
-            
-            # Check room size limit atomically
+            # Check current room size
+            current_size = self.redis_manager.get_room_size(room_id)
+            if current_size >= self._room_size_limit:
+                custom_log(f"Room {room_id} has reached size limit of {self._room_size_limit}")
+                self.socketio.emit('room_full', {
+                    'room_id': room_id,
+                    'current_size': current_size,
+                    'max_size': self._room_size_limit
+                }, room=session_id)
+                return False
+                
+            # Try to increment room size atomically
             if not self.redis_manager.check_and_increment_room_size(room_id, self._room_size_limit):
-                custom_log(f"Room {room_id} has reached its size limit of {self._room_size_limit}")
-                emit('room_full', {
-                    'message': f'Room has reached its size limit of {self._room_size_limit} users',
-                    'current_size': self.get_room_size(room_id),
-                    'limit': self._room_size_limit
+                custom_log(f"Room {room_id} has reached its size limit")
+                self.socketio.emit('room_full', {
+                    'room_id': room_id,
+                    'current_size': current_size,
+                    'max_size': self._room_size_limit
                 }, room=session_id)
                 return False
                 
             # Join the room
-            join_room(room_id, sid=session_id)
+            self.socketio.emit('room_joined', {
+                'room_id': room_id,
+                'current_size': current_size + 1,
+                'max_size': self._room_size_limit
+            }, room=session_id)
+            join_room(room_id, sid=session_id)  # Use the imported join_room function
             
-            # Update room tracking
+            # Update room memberships
             if room_id not in self.rooms:
                 self.rooms[room_id] = set()
             self.rooms[room_id].add(session_id)
@@ -429,21 +486,22 @@ class WebSocketManager:
                 self.session_rooms[session_id] = set()
             self.session_rooms[session_id].add(room_id)
             
-            # Update user presence
-            self.update_user_presence(session_id, 'online')
-            
-            # Broadcast presence update to room
-            self.broadcast_to_room(room_id, 'user_joined', {
-                'user_id': user_id,
-                'username': self.get_session_info(session_id).get('username', 'Anonymous')
-            })
-            
-            custom_log(f"Session {session_id} successfully joined room {room_id}")
+            # Broadcast user joined event if user_id is present
+            if user_id:
+                self.socketio.emit('user_joined', {
+                    'user_id': user_id,
+                    'username': session_data.get('username'),
+                    'roles': list(user_roles) if user_roles else [],  # Convert set to list for JSON serialization
+                    'current_size': current_size + 1,
+                    'max_size': self._room_size_limit
+                }, room=room_id)
+                
+            custom_log(f"Session {session_id} joined room {room_id}")
             return True
             
         except Exception as e:
             custom_log(f"Error joining room {room_id} for session {session_id}: {str(e)}")
-            emit('join_error', {'message': 'Internal server error'}, room=session_id)
+            self.socketio.emit('error', {'message': 'Failed to join room'}, room=session_id)
             return False
 
     def leave_room(self, room_id: str, session_id: str):
@@ -483,8 +541,8 @@ class WebSocketManager:
             # Leave the room last
             leave_room(room_id, sid=session_id)
             
-            # Reset room sizes to ensure accuracy
-            self.reset_room_sizes()
+            # Update room size in Redis
+            self.redis_manager.update_room_size(room_id, -1)
             
             custom_log(f"Session {session_id} successfully left room {room_id}")
             return True
@@ -669,94 +727,74 @@ class WebSocketManager:
             custom_log(f"Error cleaning up room data for {room_id}: {str(e)}")
 
     def cleanup_session(self, session_id: str):
-        """Clean up all room memberships and Redis data for a session."""
+        """Clean up all data associated with a session."""
         try:
             custom_log(f"Starting cleanup for session {session_id}")
             
             # Get session info before cleanup
-            session_info = self.get_session_info(session_id)
-            if not session_info:
-                custom_log(f"No session info found for {session_id} during cleanup")
-                # Even without session info, we should clean up room memberships
-                self._cleanup_room_memberships(session_id)
-                return
-                
-            user_id = session_info.get('user_id')
-            username = session_info.get('username', 'Anonymous')
+            session_data = self.get_session_data(session_id)
             
             # Clean up room memberships first
-            self._cleanup_room_memberships(session_id, user_id, username)
+            self._cleanup_room_memberships(session_id, session_data)
             
-            # Update user presence to offline
-            self.update_user_presence(session_id, 'offline')
-            
-            if user_id:
-                # Clean up presence data
-                presence_key = f"ws:presence:{user_id}"
-                self.redis_manager.delete(presence_key)
-                custom_log(f"Cleaned up presence data for user {user_id}")
+            # Update user presence to offline if user exists
+            if session_data and session_data.get('user_id'):
+                self.update_user_presence(session_data['user_id'], 'offline')
                 
-                # Clean up rate limit data
-                for limit_type in self._rate_limits:
-                    rate_key = f"ws:{limit_type}:{session_id}"
-                    self.redis_manager.delete(rate_key)
-                custom_log(f"Cleaned up rate limit data for session {session_id}")
-            
+            # Clean up Redis data
+            if session_data and session_data.get('user_id'):
+                self.redis_manager.delete(f"user:presence:{session_data['user_id']}")
+                self.redis_manager.delete(f"user:rate_limit:{session_data['user_id']}")
+                
             # Clean up session data last
-            self.cleanup_session_data(session_id)
+            self.redis_manager.delete(f"session:{session_id}")
             
-            # Clean up any stale room data
-            self._cleanup_stale_rooms()
-            
-            # Clean up room sizes
-            self.redis_manager.cleanup_room_sizes()
-            
-            # Reset room sizes to ensure accuracy
+            # Reset room sizes after cleanup
             self.reset_room_sizes()
             
             custom_log(f"Completed cleanup for session {session_id}")
             
         except Exception as e:
-            custom_log(f"Error during session cleanup for {session_id}: {str(e)}")
-            
-    def _cleanup_room_memberships(self, session_id: str, user_id: str = None, username: str = None):
+            custom_log(f"Error during session cleanup: {str(e)}")
+
+    def _cleanup_room_memberships(self, session_id: str, session_data: Optional[Dict] = None):
         """Clean up room memberships for a session."""
         try:
             custom_log(f"Cleaning up room memberships for session {session_id}")
             
-            # Get all rooms the session is in
-            rooms_to_leave = self.get_rooms_for_session(session_id)
-            custom_log(f"Session {session_id} is in rooms: {rooms_to_leave}")
-            
-            # Remove from all rooms
+            # Find all rooms this session is part of
+            rooms_to_leave = []
+            for room_id, members in self.rooms.items():
+                if session_id in members:
+                    rooms_to_leave.append(room_id)
+                    
+            # Leave each room
             for room_id in rooms_to_leave:
-                if room_id in self.rooms:
-                    # Update room size in Redis before removing from room
-                    self.update_room_size(room_id, -1)
-                    custom_log(f"Updated room size for {room_id} after user departure")
-                    
-                    # Remove from room tracking
-                    self.rooms[room_id].discard(session_id)
-                    if not self.rooms[room_id]:
-                        del self.rooms[room_id]
-                        custom_log(f"Room {room_id} is now empty")
-                        
-                    # Broadcast user left event if we have user info
-                    if user_id and username:
-                        self.broadcast_to_room(room_id, 'user_left', {
-                            'user_id': user_id,
-                            'username': username
-                        })
-                    custom_log(f"Removed session {session_id} from room {room_id}")
-                    
-            # Clear session's room memberships
-            if session_id in self.session_rooms:
-                del self.session_rooms[session_id]
+                # Remove from room
+                leave_room(room_id, sid=session_id)
                 
+                # Update room size
+                self.redis_manager.update_room_size(room_id, -1)
+                
+                # Broadcast user left event if we have user info
+                if session_data and session_data.get('user_id'):
+                    self.socketio.emit('user_left', {
+                        'user_id': session_data['user_id'],
+                        'room_id': room_id
+                    }, room=room_id)
+                    
+                # Remove from tracking structure
+                self.rooms[room_id].remove(session_id)
+                
+                # Clean up empty rooms
+                if not self.rooms[room_id]:
+                    del self.rooms[room_id]
+                    self._cleanup_room_data(room_id)
+                    
             custom_log(f"Completed room membership cleanup for session {session_id}")
             
         except Exception as e:
-            custom_log(f"Error cleaning up room memberships for session {session_id}: {str(e)}")
+            custom_log(f"Error during room membership cleanup: {str(e)}")
 
     def run(self, app, **kwargs):
         """Run the WebSocket server."""
@@ -813,7 +851,7 @@ class WebSocketManager:
                 if event == 'join_room':
                     room_id = payload.get('room_id')
                     if room_id:
-                        self.join_room(room_id, sid, session_info.get('user_id'), session_info.get('user_roles'))
+                        self.join_room(room_id, sid)
                 elif event == 'leave_room':
                     room_id = payload.get('room_id')
                     if room_id:

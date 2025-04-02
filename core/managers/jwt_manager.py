@@ -5,6 +5,8 @@ from tools.logger.custom_logging import custom_log
 from utils.config.config import Config
 from core.managers.redis_manager import RedisManager
 from enum import Enum
+import hashlib
+from flask import request
 
 class TokenType(Enum):
     ACCESS = "access"
@@ -16,12 +18,25 @@ class JWTManager:
         self.redis_manager = RedisManager()
         self.secret_key = Config.JWT_SECRET_KEY
         self.algorithm = Config.JWT_ALGORITHM
-        self.access_token_expire_seconds = Config.JWT_ACCESS_TOKEN_EXPIRES
-        self.refresh_token_expire_seconds = Config.JWT_REFRESH_TOKEN_EXPIRES
+        # Shorter token lifetimes
+        self.access_token_expire_seconds = 1800  # 30 minutes
+        self.refresh_token_expire_seconds = 86400  # 24 hours
+        self.websocket_token_expire_seconds = 1800  # 30 minutes
         custom_log("JWTManager initialized")
 
+    def _get_client_fingerprint(self) -> str:
+        """Generate a unique client fingerprint based on IP and User-Agent."""
+        try:
+            ip = request.remote_addr
+            user_agent = request.headers.get('User-Agent', '')
+            fingerprint = hashlib.sha256(f"{ip}-{user_agent}".encode()).hexdigest()
+            return fingerprint
+        except Exception as e:
+            custom_log(f"Error generating client fingerprint: {str(e)}")
+            return ""
+
     def create_token(self, data: Dict[str, Any], token_type: TokenType, expires_in: Optional[int] = None) -> str:
-        """Create a new JWT token of specified type."""
+        """Create a new JWT token of specified type with client binding."""
         to_encode = data.copy()
         
         # Set expiration based on token type
@@ -33,7 +48,12 @@ class JWTManager:
             elif token_type == TokenType.REFRESH:
                 expire = datetime.utcnow() + timedelta(seconds=self.refresh_token_expire_seconds)
             else:  # WEBSOCKET
-                expire = datetime.utcnow() + timedelta(seconds=self.access_token_expire_seconds)
+                expire = datetime.utcnow() + timedelta(seconds=self.websocket_token_expire_seconds)
+        
+        # Add client fingerprint for token binding
+        client_fingerprint = self._get_client_fingerprint()
+        if client_fingerprint:
+            to_encode["fingerprint"] = client_fingerprint
             
         to_encode.update({
             "exp": expire,
@@ -62,6 +82,13 @@ class JWTManager:
             if expected_type and payload.get("type") != expected_type.value:
                 custom_log(f"Invalid token type. Expected: {expected_type.value}, Got: {payload.get('type')}")
                 return None
+            
+            # Verify client fingerprint if present
+            if "fingerprint" in payload:
+                current_fingerprint = self._get_client_fingerprint()
+                if current_fingerprint and payload["fingerprint"] != current_fingerprint:
+                    custom_log("Token bound to different client")
+                    return None
                 
             return payload
         except jwt.ExpiredSignatureError:
@@ -72,20 +99,16 @@ class JWTManager:
             return None
 
     def revoke_token(self, token: str) -> bool:
-        """Revoke a JWT token."""
+        """Revoke a token by removing it from Redis."""
         try:
-            # Store revoked token in Redis with its expiration time
-            payload = jwt.decode(token, self.secret_key, algorithms=[self.algorithm])
-            exp_timestamp = payload.get("exp")
-            if exp_timestamp:
-                # Store until token expires
-                ttl = exp_timestamp - int(datetime.utcnow().timestamp())
-                if ttl > 0:
-                    self.redis_manager.set(f"jwt:revoked:{token}", "1", expire=ttl)
-                    custom_log(f"Token revoked: {token[:10]}...")
-                    return True
-            return False
-        except jwt.JWTError:
+            # Remove from all token types
+            for token_type in TokenType:
+                key = f"token:{token_type.value}:{token}"
+                self.redis_manager.delete(key)
+            custom_log(f"Token revoked: {token[:10]}...")
+            return True
+        except Exception as e:
+            custom_log(f"Error revoking token: {str(e)}")
             return False
 
     def refresh_token(self, refresh_token: str) -> Optional[str]:
@@ -99,14 +122,34 @@ class JWTManager:
         return None
 
     def _store_token(self, token: str, expire: datetime, token_type: TokenType):
-        """Store token in Redis for tracking."""
-        ttl = int(expire.timestamp() - datetime.utcnow().timestamp())
-        if ttl > 0:
-            self.redis_manager.set(f"jwt:active:{token_type.value}:{token}", "1", expire=ttl)
+        """Store token in Redis with proper prefix and expiration."""
+        try:
+            # Use a prefix for faster revocation checks
+            key = f"token:{token_type.value}:{token}"
+            ttl = int((expire - datetime.utcnow()).total_seconds())
+            
+            if ttl > 0:
+                # Store token with its TTL
+                self.redis_manager.set(key, "1", expire=ttl)
+                custom_log(f"Stored {token_type.value} token with TTL {ttl}s")
+            else:
+                custom_log(f"Token already expired, not storing: {token[:10]}...")
+            
+        except Exception as e:
+            custom_log(f"Error storing token: {str(e)}")
 
     def _is_token_revoked(self, token: str) -> bool:
-        """Check if a token is revoked."""
-        return bool(self.redis_manager.get(f"jwt:revoked:{token}"))
+        """Check if a token is revoked using prefix-based lookup."""
+        try:
+            # Check all token types since we don't know which type it is
+            for token_type in TokenType:
+                key = f"token:{token_type.value}:{token}"
+                if self.redis_manager.exists(key):
+                    return False  # Token exists in Redis, so it's not revoked
+            return True  # Token not found in any type, so it's revoked
+        except Exception as e:
+            custom_log(f"Error checking token revocation: {str(e)}")
+            return True  # Fail safe: consider token revoked on error
 
     def cleanup_expired_tokens(self):
         """Clean up expired tokens from Redis."""

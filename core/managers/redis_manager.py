@@ -302,7 +302,7 @@ class RedisManager:
     def set_room_size(self, room_id: str, size: int, expire: int = 3600) -> bool:
         """Set room size in Redis without encryption."""
         try:
-            key = f"ws:room:{room_id}:size"
+            key = f"room:size:{room_id}"
             self.redis.set(key, str(size))  # Convert int to string
             if expire:
                 self.redis.expire(key, expire)
@@ -315,7 +315,7 @@ class RedisManager:
     def get_room_size(self, room_id: str) -> int:
         """Get room size from Redis without encryption."""
         try:
-            key = f"ws:room:{room_id}:size"
+            key = f"room:size:{room_id}"
             value = self.redis.get(key)
             size = int(value) if value is not None else 0
             custom_log(f"Got room size for {room_id}: {size}")
@@ -324,81 +324,92 @@ class RedisManager:
             custom_log(f"Error getting room size from Redis: {str(e)}")
             return 0
 
-    def update_room_size(self, room_id: str, delta: int) -> bool:
-        """Update room size in Redis without encryption."""
+    def update_room_size(self, room_id: str, delta: int):
+        """Update room size atomically."""
         try:
-            key = f"ws:room:{room_id}:size"
-            custom_log(f"Updating room size for {room_id} with delta {delta}")
-            
-            # Get current size first
-            current_size = self.get_room_size(room_id)
-            custom_log(f"Current room size for {room_id}: {current_size}")
-            
-            # Calculate new size
-            new_size = max(0, current_size + delta)  # Ensure size doesn't go below 0
-            
-            # Set new size
-            return self.set_room_size(room_id, new_size)
-            
-        except Exception as e:
-            custom_log(f"Error updating room size for {room_id}: {str(e)}")
-            return False
-
-    def check_and_increment_room_size(self, room_id: str, limit: int) -> bool:
-        """Atomically check and increment room size if under limit."""
-        try:
-            key = f"ws:room:{room_id}:size"
-            custom_log(f"Checking room size for {room_id} with limit {limit}")
+            key = f"room:size:{room_id}"
             
             # Use Redis transaction for atomicity
             with self.redis.pipeline() as pipe:
                 while True:
                     try:
-                        # Watch the key for changes
+                        # Watch the room size key
                         pipe.watch(key)
                         
                         # Get current size
-                        current_size = self.get_room_size(room_id)
-                        custom_log(f"Current room size for {room_id}: {current_size}")
+                        current_size = pipe.get(key)
+                        current_size = int(current_size) if current_size else 0
                         
-                        # Check limit
-                        if current_size >= limit:
-                            custom_log(f"Room {room_id} has reached its size limit of {limit}")
-                            pipe.unwatch()
-                            return False
+                        # Calculate new size
+                        new_size = max(0, current_size + delta)
                         
-                        # Start transaction
+                        # Update size
                         pipe.multi()
+                        if new_size > 0:
+                            pipe.set(key, str(new_size))
+                            pipe.expire(key, 3600)  # 1 hour expiry
+                        else:
+                            pipe.delete(key)
+                            
+                        # Execute transaction
+                        pipe.execute()
+                        custom_log(f"Updated room {room_id} size from {current_size} to {new_size}")
+                        return
                         
+                    except Exception as e:
+                        custom_log(f"Error in room size update transaction: {str(e)}")
+                        continue
+                        
+        except Exception as e:
+            custom_log(f"Error updating room size: {str(e)}")
+
+    def check_and_increment_room_size(self, room_id: str, room_size_limit: int = 100) -> bool:
+        """Atomically check and increment room size if under limit."""
+        try:
+            key = f"room:size:{room_id}"
+            
+            # Use Redis transaction for atomicity
+            with self.redis.pipeline() as pipe:
+                while True:
+                    try:
+                        # Watch the room size key
+                        pipe.watch(key)
+                        
+                        # Get current size
+                        current_size = pipe.get(key)
+                        current_size = int(current_size) if current_size else 0
+                        
+                        # Check if we've hit the limit
+                        if current_size >= room_size_limit:
+                            custom_log(f"Room {room_id} has reached size limit of {room_size_limit}")
+                            return False
+                            
                         # Increment size
-                        new_size = current_size + 1
-                        pipe.set(key, str(new_size))
-                        pipe.expire(key, 3600)  # 1 hour expiration
+                        pipe.multi()
+                        pipe.incr(key)
+                        pipe.expire(key, 3600)  # 1 hour expiry
                         
                         # Execute transaction
                         pipe.execute()
-                        custom_log(f"Successfully incremented room size for {room_id} to {new_size}")
+                        custom_log(f"Incremented room {room_id} size to {current_size + 1}")
                         return True
                         
-                    except redis.WatchError:
-                        # Another client modified the key while we were working
-                        custom_log(f"Retrying room size increment for {room_id} due to concurrent modification")
+                    except Exception as e:
+                        custom_log(f"Error in room size transaction: {str(e)}")
                         continue
-                    
+                        
         except Exception as e:
-            custom_log(f"Error checking and incrementing room size for {room_id}: {str(e)}")
+            custom_log(f"Error checking and incrementing room size: {str(e)}")
             return False
 
-    def reset_room_size(self, room_id: str) -> bool:
-        """Reset room size in Redis."""
+    def reset_room_size(self, room_id: str):
+        """Reset room size to 0."""
         try:
-            key = f"ws:room:{room_id}:size"
+            key = f"room:size:{room_id}"
             self.redis.delete(key)
             custom_log(f"Reset room size for {room_id}")
-            return True
         except Exception as e:
-            custom_log(f"Error resetting room size for {room_id}: {str(e)}")
-            return False
+            custom_log(f"Error resetting room size: {str(e)}")
 
     def cleanup_room_keys(self, room_id: str) -> bool:
         """Clean up all Redis keys related to a room using pattern matching."""
