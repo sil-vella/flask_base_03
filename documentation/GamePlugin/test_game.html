@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Game Plugin Test</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -106,6 +106,25 @@
             border-radius: 4px;
             margin: 5px 0;
         }
+        .login-form {
+            display: none;
+            margin-bottom: 20px;
+        }
+        .login-form.active {
+            display: block;
+        }
+        .game-section {
+            display: none;
+        }
+        .game-section.active {
+            display: block;
+        }
+        .user-info {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: #E3F2FD;
+            border-radius: 5px;
+        }
     </style>
 </head>
 <body>
@@ -113,42 +132,58 @@
     
     <div class="container">
         <div class="panel">
-            <h2>Connection Setup</h2>
-            <div>
-                <input type="text" id="jwtToken" placeholder="JWT Token" style="width: 100%;">
-                <button onclick="connect()">Connect</button>
-                <button onclick="disconnect()" id="disconnectBtn" disabled>Disconnect</button>
+            <div id="loginSection" class="login-form active">
+                <h2>Login</h2>
+                <div>
+                    <input type="email" id="email" placeholder="Email" value="test@example.com">
+                    <input type="password" id="password" placeholder="Password" value="testpass123">
+                    <button onclick="login()" style="width: 100%;">Login</button>
+                </div>
             </div>
-            
-            <h2>Game Session</h2>
-            <div>
-                <input type="text" id="sessionId" placeholder="Session ID" style="width: 100%;">
-                <button onclick="joinGame()" id="joinBtn" disabled>Join Game</button>
-                <button onclick="leaveGame()" id="leaveBtn" disabled>Leave Game</button>
+
+            <div id="userInfo" class="user-info" style="display: none;">
+                <p>Logged in as: <span id="username"></span></p>
+                <button onclick="logout()">Logout</button>
             </div>
-            
-            <h2>Game Board</h2>
-            <div class="game-board" id="gameBoard">
-                <!-- Cells will be generated dynamically -->
+
+            <div id="gameSection" class="game-section">
+                <h2>Connection Setup</h2>
+                <div>
+                    <input type="text" id="jwtToken" placeholder="JWT Token" style="width: 100%;" readonly>
+                    <button onclick="connect()">Connect</button>
+                    <button onclick="disconnect()" id="disconnectBtn" disabled>Disconnect</button>
+                </div>
+                
+                <h2>Game Session</h2>
+                <div>
+                    <input type="text" id="sessionId" placeholder="Session ID" style="width: 100%;">
+                    <button onclick="joinGame()" id="joinBtn" disabled>Join Game</button>
+                    <button onclick="leaveGame()" id="leaveBtn" disabled>Leave Game</button>
+                </div>
+                
+                <h2>Game Board</h2>
+                <div class="game-board" id="gameBoard">
+                    <!-- Cells will be generated dynamically -->
+                </div>
+                
+                <h2>Game Actions</h2>
+                <div>
+                    <button onclick="makeMove()" id="moveBtn" disabled>Make Move</button>
+                    <button onclick="submitAnswer()" id="answerBtn" disabled>Submit Answer</button>
+                    <button onclick="skipTurn()" id="skipBtn" disabled>Skip Turn</button>
+                    <button onclick="endTurn()" id="endTurnBtn" disabled>End Turn</button>
+                </div>
+                
+                <h2>Players</h2>
+                <ul class="player-list" id="playerList">
+                    <!-- Players will be listed here -->
+                </ul>
             </div>
-            
-            <h2>Game Actions</h2>
-            <div>
-                <button onclick="makeMove()" id="moveBtn" disabled>Make Move</button>
-                <button onclick="submitAnswer()" id="answerBtn" disabled>Submit Answer</button>
-                <button onclick="skipTurn()" id="skipBtn" disabled>Skip Turn</button>
-                <button onclick="endTurn()" id="endTurnBtn" disabled>End Turn</button>
-            </div>
-            
-            <h2>Players</h2>
-            <ul class="player-list" id="playerList">
-                <!-- Players will be listed here -->
-            </ul>
         </div>
         
         <div class="panel">
             <h2>Status</h2>
-            <div id="status" class="status">Not connected</div>
+            <div id="status" class="status">Not logged in</div>
             
             <h2>Event Log</h2>
             <div class="log-panel" id="eventLog"></div>
@@ -160,6 +195,12 @@
         let currentSession = null;
         let selectedCell = null;
         let gameState = null;
+        let accessToken = null;
+        let refreshToken = null;
+        let isConnected = false;
+        let retryCount = 0;
+        const maxRetries = 5;
+        const retryDelay = 2000; // 2 seconds
 
         // Initialize game board
         function initGameBoard() {
@@ -184,30 +225,190 @@
             selectedCell = index;
         }
 
+        // Login function
+        async function login() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+
+            try {
+                const response = await fetch('http://localhost:5000/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    },
+                    body: JSON.stringify({ email, password })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                log('Server response: ' + JSON.stringify(data)); // Debug log
+                
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                // Check for tokens in the nested structure
+                if (!data.tokens?.access_token || !data.tokens?.refresh_token) {
+                    log('Server response missing tokens: ' + JSON.stringify(data), true);
+                    throw new Error('Server response missing authentication tokens');
+                }
+
+                // Store tokens from the nested structure
+                accessToken = data.tokens.access_token;
+                refreshToken = data.tokens.refresh_token;
+
+                // Update UI
+                document.getElementById('username').textContent = data.user?.username || email;
+                document.getElementById('loginSection').classList.remove('active');
+                document.getElementById('userInfo').style.display = 'block';
+                document.getElementById('gameSection').classList.add('active');
+                
+                // Connect to WebSocket only after successful login and token validation
+                connect();
+                
+                log('Login successful');
+            } catch (error) {
+                log('Login failed: ' + error.message, true);
+                if (error.message.includes('Failed to fetch')) {
+                    log('Make sure the server is running at http://localhost:5000', true);
+                }
+                // Reset UI on login failure
+                document.getElementById('loginSection').classList.add('active');
+                document.getElementById('userInfo').style.display = 'none';
+                document.getElementById('gameSection').classList.remove('active');
+            }
+        }
+
+        async function logout() {
+            try {
+                const response = await fetch('http://localhost:5000/logout', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Accept': 'application/json'
+                    },
+                    body: JSON.stringify({ user_id: 1 }) // In a real app, get this from the token
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                // Disconnect WebSocket
+                if (socket) {
+                    socket.disconnect();
+                    socket = null;
+                }
+                
+                // Clear tokens
+                accessToken = null;
+                refreshToken = null;
+                
+                // Reset UI
+                document.getElementById('loginSection').classList.add('active');
+                document.getElementById('userInfo').style.display = 'none';
+                document.getElementById('gameSection').classList.remove('active');
+                
+                log('Logged out successfully');
+            } catch (error) {
+                log('Logout failed: ' + error.message, true);
+                if (error.message.includes('Failed to fetch')) {
+                    log('Make sure the server is running at http://localhost:5000', true);
+                }
+            }
+        }
+
         // Connect to WebSocket server
         function connect() {
-            const token = document.getElementById('jwtToken').value;
-            if (!token) {
-                log('Error: JWT token is required');
+            // Validate token before attempting connection
+            if (!accessToken) {
+                log('No access token available', true);
                 return;
             }
 
+            // Disconnect existing socket if any
+            if (socket) {
+                socket.disconnect();
+            }
+
+            log('Attempting to connect to WebSocket server...');
+
             socket = io('http://localhost:5000', {
-                auth: { token }
+                query: {
+                    token: accessToken,
+                    room_id: 'game_room'
+                },
+                reconnection: true,
+                reconnectionAttempts: maxRetries,
+                reconnectionDelay: retryDelay,
+                auth: {
+                    token: accessToken
+                }
             });
 
             socket.on('connect', () => {
+                isConnected = true;
+                retryCount = 0;
                 log('Connected to server');
                 updateStatus('Connected', 'success');
                 document.getElementById('disconnectBtn').disabled = false;
                 document.getElementById('joinBtn').disabled = false;
             });
 
+            socket.on('connect_error', (error) => {
+                isConnected = false;
+                document.getElementById('status').textContent = 'Connection Error';
+                document.getElementById('status').className = 'status error';
+                log('Connection error: ' + error.message, true);
+
+                // Handle authentication errors
+                if (error.message.includes('Authentication required') || 
+                    error.message.includes('Invalid authentication')) {
+                    log('Authentication error: Please log in again', true);
+                    // Reset UI to login state
+                    document.getElementById('loginSection').classList.add('active');
+                    document.getElementById('userInfo').style.display = 'none';
+                    document.getElementById('gameSection').classList.remove('active');
+                    // Clear tokens
+                    accessToken = null;
+                    refreshToken = null;
+                }
+            });
+
             socket.on('disconnect', () => {
+                isConnected = false;
+                document.getElementById('status').textContent = 'Disconnected';
+                document.getElementById('status').className = 'status error';
                 log('Disconnected from server');
-                updateStatus('Disconnected', 'error');
                 document.getElementById('disconnectBtn').disabled = true;
                 document.getElementById('joinBtn').disabled = true;
+
+                // Only retry if we still have a token
+                if (accessToken && retryCount < maxRetries) {
+                    retryCount++;
+                    log(`Retrying connection (${retryCount}/${maxRetries})...`);
+                    setTimeout(connect, retryDelay);
+                } else {
+                    log('Connection failed. Please log in again.', true);
+                    // Reset UI to login state
+                    document.getElementById('loginSection').classList.add('active');
+                    document.getElementById('userInfo').style.display = 'none';
+                    document.getElementById('gameSection').classList.remove('active');
+                    // Clear tokens
+                    accessToken = null;
+                    refreshToken = null;
+                }
             });
 
             socket.on('game_joined', (data) => {
